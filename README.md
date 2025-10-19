@@ -2,6 +2,23 @@
 
 Firmware de Arduino para sensor basado en ESP32-C3 con comunicación Modbus RTU.
 
+> **🚀 ¿Primera vez?** Lee la [Guía de Inicio Rápido (QUICKSTART.md)](QUICKSTART.md) para poner en marcha tu sensor en minutos.
+
+## Tabla de Contenidos
+
+- [Descripción](#descripción)
+- [Características](#características)
+- [Hardware Requerido](#hardware-requerido)
+- [Instalación](#instalación)
+- [Configuración](#configuración)
+- [Registros Modbus](#registros-modbus)
+- [Integración de Sensores](#integración-de-sensores)
+- [Pruebas](#pruebas)
+- [Troubleshooting](#troubleshooting)
+- [Documentación Adicional](#documentación-adicional)
+- [Contribuciones](#contribuciones)
+- [Licencia](#licencia)
+
 ## Descripción
 
 Este proyecto implementa un sensor inteligente utilizando el microcontrolador ESP32-C3 que se comunica mediante el protocolo Modbus RTU sobre RS-485. Es ideal para aplicaciones industriales, domótica y sistemas de monitoreo.
@@ -303,6 +320,32 @@ client.close()
 - Comprobar la alimentación de los sensores (3.3V o 5V según modelo)
 - Revisar las resistencias pull-up en I2C si corresponde
 - Validar que los valores se multiplican por 100 correctamente
+
+## Troubleshooting
+
+Ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md) para una guía completa de solución de problemas.
+
+### Problemas Comunes
+
+- **No compila**: Verificar bibliotecas instaladas
+- **No sube**: Verificar driver USB-Serial y mantener BOOT presionado
+- **No comunica**: Verificar conexiones RS-485 y configuración Modbus
+- **Lecturas erróneas**: Verificar alimentación y terminaciones del bus
+
+## Documentación Adicional
+
+Este proyecto incluye documentación completa en español:
+
+| Documento | Descripción |
+|-----------|-------------|
+| [QUICKSTART.md](QUICKSTART.md) | 🚀 Guía de inicio rápido - Pon en marcha tu sensor en 30 minutos |
+| [README.md](README.md) | 📖 Documentación principal y referencia completa |
+| [WIRING.md](WIRING.md) | 🔌 Diagramas de conexiones y pinout detallado |
+| [EXAMPLES.md](EXAMPLES.md) | 💻 Ejemplos de código Python y Node.js para maestro Modbus |
+| [ARDUINO_SETUP.md](ARDUINO_SETUP.md) | ⚙️ Configuración paso a paso de Arduino IDE |
+| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | 🔧 Guía completa de solución de problemas |
+| [CHANGELOG.md](CHANGELOG.md) | 📝 Historial de cambios y versiones |
+| [verify_modbus.py](verify_modbus.py) | ✅ Script de verificación automática |
 
 ## Mejoras Futuras
 
