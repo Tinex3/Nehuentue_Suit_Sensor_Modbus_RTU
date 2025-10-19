@@ -212,6 +212,29 @@ void readSensors() {
 
 ## Pruebas
 
+### Script de Verificación Automática
+
+Se incluye un script Python para verificar automáticamente la comunicación:
+
+```bash
+# Instalar dependencia
+pip install pymodbus
+
+# Ejecutar verificación
+python3 verify_modbus.py /dev/ttyUSB0 9600 1
+
+# En Windows
+python verify_modbus.py COM3 9600 1
+```
+
+El script verificará:
+- ✓ Conexión serial
+- ✓ Comunicación Modbus
+- ✓ Lectura de información del dispositivo
+- ✓ Lectura de sensores
+- ✓ Control del LED
+- ✓ Configuración de parámetros
+
 ### Usando QModMaster (Linux/Windows/Mac)
 
 1. Descargar [QModMaster](https://sourceforge.net/projects/qmodmaster/)
