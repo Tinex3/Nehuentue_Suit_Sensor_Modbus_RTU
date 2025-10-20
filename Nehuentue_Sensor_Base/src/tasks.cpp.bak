@@ -1,0 +1,1276 @@
+#include "tasks.h"
+#include <WiFiManager.h>  // Para WiFiConfig
+#include <MQTTManager.h>  // Para MQTTConfig
+#include <ModbusManager.h>  // Para ModbusResponse
+#include "config.h"  // Para SensorConfig
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <freertos/queue.h>
+#include <time.h>
+#include <esp_system.h>
+
+// ============== COLORES ANSI PARA TERMINAL ==============
+#define ANSI_RESET   "\033[0m"
+#define ANSI_BOLD    "\033[1m"
+#define ANSI_RED     "\033[31m"
+#define ANSI_GREEN   "\033[32m"
+#define ANSI_YELLOW  "\033[33m"
+#define ANSI_BLUE    "\033[34m"
+#define ANSI_MAGENTA "\033[35m"
+#define ANSI_CYAN    "\033[36m"
+#define ANSI_WHITE   "\033[37m"
+#define ANSI_BG_RED  "\033[41m"
+
+// Includes de WiFi y MQTT (después de las macros)
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// Declaraciones forward (funciones auxiliares de tiempo)
+time_t getCurrentTimestamp();
+void getCurrentTimeString(char* buffer, size_t bufferSize);
+
+// Variables compartidas
+SensorData sensorData;
+SemaphoreHandle_t dataMutex = NULL;
+WiFiConfig wifiConfig;
+MQTTTopics mqttTopics;
+MQTTConfig mqttConfig;
+SensorConfig sensorConfig;  // 1 solo sensor (no array)
+
+// Colas para comunicación entre tareas
+QueueHandle_t eepromQueue = NULL;  // EEPROM deshabilitada temporalmente
+
+// =============================================================================
+// TAREA 1: MODBUS - Lee datos del sensor via Modbus RTU
+// =============================================================================
+void modbusTask(void *pvParameters) {
+    Serial.println("[MODBUS TASK] Iniciada");
+    
+    // Espera inicial para que el sistema se estabilice
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    const TickType_t pollingInterval = pdMS_TO_TICKS(5000); // 5 segundos
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    
+    for (;;) {
+        // Verifica si el sensor está habilitado
+        if (!sensorConfig.enabled) {
+            Serial.println("[MODBUS TASK] Sensor deshabilitado, esperando...");
+            vTaskDelayUntil(&lastWakeTime, pollingInterval);
+            continue;
+        }
+        
+        uint8_t addr = sensorConfig.modbusAddress;
+        uint8_t func = sensorConfig.modbusFunction;
+        uint16_t start = sensorConfig.registerStart;
+        uint16_t count = sensorConfig.registerCount;
+        
+        Serial.printf("\n[MODBUS TASK] Leyendo sensor (%s): Función=0x%02X, Addr=%d, Start=%d, Count=%d\n",
+                     sensorConfig.type, func, addr, start, count);
+        
+        ModbusResponse response;
+        
+        // Ejecuta la función Modbus correspondiente
+        switch (func) {
+            case 0x01: // Read Coils
+                Serial.printf("[MODBUS TASK] ⚠️ Función 0x01 (Read Coils) no implementada aún\n");
+                response.success = false;
+                break;
+                
+            case 0x02: // Read Discrete Inputs
+                Serial.printf("[MODBUS TASK] ⚠️ Función 0x02 (Read Discrete Inputs) no implementada aún\n");
+                response.success = false;
+                break;
+                
+            case 0x03: // Read Holding Registers
+                response = modbusReadHoldingRegisters(addr, start, count);
+                break;
+                
+            case 0x04: // Read Input Registers
+                response = modbusReadInputRegisters(addr, start, count);
+                break;
+                
+            default:
+                Serial.printf("[MODBUS TASK] ❌ Función Modbus 0x%02X no soportada\n", func);
+                response.success = false;
+                break;
+        }
+        
+        // Guarda respuesta Modbus cruda completa (protegido por mutex)
+        if (dataMutex != NULL && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            sensorData.modbusResponse.valid = response.success;
+            sensorData.modbusResponse.length = response.length;
+            sensorData.modbusResponse.slaveAddress = addr;
+            sensorData.modbusResponse.functionCode = func;
+            sensorData.modbusResponse.registerStart = start;
+            sensorData.modbusResponse.registerCount = count;
+            sensorData.modbusResponse.timestamp = millis();
+            memcpy(sensorData.modbusResponse.data, response.data, response.length);
+            
+            if (response.success) {
+                Serial.printf("[MODBUS TASK] ✓ Respuesta recibida: %d bytes\n", response.length);
+                Serial.print("[MODBUS TASK] Datos HEX: ");
+                for (int i = 0; i < response.length; i++) {
+                    Serial.printf("%02X ", response.data[i]);
+                }
+                Serial.println();
+            } else {
+                Serial.printf("[MODBUS TASK] ❌ Lectura fallida\n");
+            }
+            
+            xSemaphoreGive(dataMutex);
+        }
+        
+        // Espera hasta el próximo ciclo
+        vTaskDelayUntil(&lastWakeTime, pollingInterval);
+    }
+}
+
+// =============================================================================
+// TAREA 2: DECODER - Decodifica datos del sensor
+// =============================================================================
+void decoderTask(void *pvParameters) {
+    Serial.println("[DECODER TASK] Iniciada");
+    
+    // Espera inicial para que el sistema se estabilice
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    
+    const TickType_t decodeInterval = pdMS_TO_TICKS(1000); // Revisar cada 1 segundo
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    
+    for (;;) {
+        // Lee respuesta Modbus cruda (protegido por mutex)
+        if (dataMutex != NULL && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (sensorData.modbusResponse.valid && sensorData.modbusResponse.length >= 5) {
+                // Decodifica la respuesta Modbus solo si es función de lectura de registros
+                if (sensorData.modbusResponse.functionCode == 0x03 || 
+                    sensorData.modbusResponse.functionCode == 0x04) {
+                    
+                    // Formato: [SlaveID][Function][ByteCount][Data...][CRC]
+                    uint8_t byteCount = sensorData.modbusResponse.data[2];
+                    uint8_t expectedCount = sensorData.modbusResponse.registerCount * 2;  // 2 bytes por registro
+                    
+                    if (byteCount >= expectedCount) {
+                        Serial.printf("\n[DECODER TASK] Decodificando %d registro(s):\n", 
+                                     sensorData.modbusResponse.registerCount);
+                        
+                        // Extrae registros (16 bits cada uno, Big Endian)
+                        sensorData.registerCount = sensorData.modbusResponse.registerCount;
+                        
+                        for (uint8_t i = 0; i < sensorData.registerCount && i < 125; i++) {
+                            uint16_t reg = (sensorData.modbusResponse.data[3 + i*2] << 8) | 
+                                          sensorData.modbusResponse.data[4 + i*2];
+                            sensorData.registers[i] = reg;
+                            
+                            // Muestra primeros 10 registros en log
+                            if (i < 10) {
+                                Serial.printf("  [%d] = %d (0x%04X)\n", i, reg, reg);
+                            }
+                        }
+                        
+                        if (sensorData.registerCount > 10) {
+                            Serial.printf("  ... (%d registros más)\n", sensorData.registerCount - 10);
+                        }
+                        
+                        sensorData.valid = true;
+                        sensorData.timestamp = sensorData.modbusResponse.timestamp;
+                    } else {
+                        Serial.printf("[DECODER TASK] ⚠️ ByteCount incorrecto: %d (esperado: %d)\n", 
+                                     byteCount, expectedCount);
+                        sensorData.valid = false;
+                    }
+                } else {
+                    Serial.printf("[DECODER TASK] Función 0x%02X no requiere decodificación de registros\n",
+                                 sensorData.modbusResponse.functionCode);
+                }
+            }
+            
+            xSemaphoreGive(dataMutex);
+        }
+        
+        // Espera hasta el próximo ciclo
+        vTaskDelayUntil(&lastWakeTime, decodeInterval);
+    }
+}
+
+// =============================================================================
+// TAREA 3: MQTT - Conecta WiFi, MQTT y publica telemetría/estado
+// =============================================================================
+
+// =============================================================================
+// FUNCIÓN AUXILIAR: Construye los tópicos MQTT dinámicamente
+// =============================================================================
+void buildMQTTTopics(const char* deviceId) {
+    snprintf(mqttTopics.telemetry, sizeof(mqttTopics.telemetry), 
+             "devices/%s/telemetry", deviceId);
+    
+    snprintf(mqttTopics.modbusRaw, sizeof(mqttTopics.modbusRaw), 
+             "devices/%s/modbus/response", deviceId);
+    
+    snprintf(mqttTopics.status, sizeof(mqttTopics.status), 
+             "devices/%s/status", deviceId);
+    
+    snprintf(mqttTopics.eventError, sizeof(mqttTopics.eventError), 
+             "devices/%s/event/error", deviceId);
+    
+    snprintf(mqttTopics.eventConnect, sizeof(mqttTopics.eventConnect), 
+             "devices/%s/event/connect", deviceId);
+    
+    snprintf(mqttTopics.cmdBase, sizeof(mqttTopics.cmdBase), 
+             "devices/%s/cmd/#", deviceId);
+    
+    Serial.println("\n[MQTT] Tópicos construidos:");
+    Serial.printf("  Telemetría: %s\n", mqttTopics.telemetry);
+    Serial.printf("  Modbus RAW: %s\n", mqttTopics.modbusRaw);
+    Serial.printf("  Estado: %s\n", mqttTopics.status);
+    Serial.printf("  Error: %s\n", mqttTopics.eventError);
+    Serial.printf("  Conexión: %s\n", mqttTopics.eventConnect);
+    Serial.printf("  Comandos: %s\n\n", mqttTopics.cmdBase);
+}
+
+// =============================================================================
+// FUNCIÓN AUXILIAR: Mapea estados de MQTT a texto legible
+// =============================================================================
+const char* mqttStateToString(int8_t state) {
+    switch(state) {
+        case -4: return "CONNECTION_TIMEOUT";
+        case -3: return "CONNECTION_LOST";
+        case -2: return "CONNECT_FAILED";
+        case -1: return "DISCONNECTED";
+        case 0:  return "CONNECTED";
+        case 1:  return "BAD_PROTOCOL";
+        case 2:  return "BAD_CLIENT_ID";
+        case 3:  return "UNAVAILABLE";
+        case 4:  return "BAD_CREDENTIALS";
+        case 5:  return "UNAUTHORIZED";
+        default: return "UNKNOWN";
+    }
+}
+
+// =============================================================================
+// FUNCIÓN AUXILIAR: Publica evento de error MQTT
+// =============================================================================
+void publishMQTTError(const char* errorType, const char* message, int8_t state) {
+    char errorPayload[300];
+    char datetime[32];
+    bool rtcSynced = (getCurrentTimestamp() > 100000); // Validación simple
+    if (rtcSynced) {
+        getCurrentTimeString(datetime, sizeof(datetime));
+    } else {
+        snprintf(datetime, sizeof(datetime), "no-sync");
+    }
+    unsigned long timestamp = rtcSynced ? getCurrentTimestamp() : millis();
+    
+    snprintf(errorPayload, sizeof(errorPayload),
+             "{\"type\":\"mqtt_%s\",\"severity\":\"error\",\"message\":\"ESP32 %s\",\"state\":%d,\"state_name\":\"%s\",\"timestamp\":%lu,\"datetime\":\"%s\"}",
+             errorType, message, state, mqttStateToString(state), timestamp, datetime);
+    
+    Serial.printf("\n%s%s[MQTT ERROR] ⚠️ Error detectado:%s\n", ANSI_BOLD, ANSI_RED, ANSI_RESET);
+    Serial.printf("  %sTipo:%s mqtt_%s\n", ANSI_YELLOW, ANSI_RESET, errorType);
+    Serial.printf("  %sMensaje:%s ESP32 %s\n", ANSI_YELLOW, ANSI_RESET, message);
+    Serial.printf("  %sEstado:%s %d (%s)\n", ANSI_YELLOW, ANSI_RESET, state, mqttStateToString(state));
+    Serial.printf("  %sTopic:%s %s\n", ANSI_CYAN, ANSI_RESET, mqttTopics.eventError);
+    Serial.printf("  %sPayload:%s %s\n\n", ANSI_CYAN, ANSI_RESET, errorPayload);
+    
+    // Intentar publicar el error (si está conectado)
+    // if (mqttClient.connected()) {
+    //     mqttClient.publish(mqttTopics.eventError, errorPayload, false);
+    // }
+}
+
+// =============================================================================
+// FUNCIÓN AUXILIAR: Sincronizar RTC interno con servidor NTP
+// =============================================================================
+bool syncRTCWithNTP() {
+    // Servidores NTP (Ubuntu NTP pool)
+    const char* ntpServer1 = "ntp.ubuntu.com";
+    const char* ntpServer2 = "pool.ntp.org";
+    const char* ntpServer3 = "time.nist.gov";
+    
+    // Zona horaria de Chile: UTC-3 (horario estándar continental)
+    // Si estás en horario de verano (octubre-marzo), usa UTC-4
+    const long gmtOffset_sec = -3 * 3600;  // UTC-3 para Chile
+    const int daylightOffset_sec = 0;      // Cambia a 3600 si quieres horario de verano
+    
+    Serial.printf("\n%s[RTC] Sincronizando con NTP...%s\n", ANSI_CYAN, ANSI_RESET);
+    Serial.printf("  %sServidores:%s %s, %s\n", ANSI_CYAN, ANSI_RESET, ntpServer1, ntpServer2);
+    Serial.printf("  %sZona horaria:%s Chile (UTC-3)\n", ANSI_CYAN, ANSI_RESET);
+    
+    // Configurar NTP
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
+    
+    // Esperar sincronización (máximo 10 segundos)
+    struct tm timeinfo;
+    int retry = 0;
+    const int maxRetries = 10;
+    
+    while (!getLocalTime(&timeinfo) && retry < maxRetries) {
+        Serial.print(".");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        retry++;
+    }
+    
+    if (retry < maxRetries) {
+        // Sincronización exitosa
+        time_t now = time(nullptr);
+        Serial.printf("\n  %s✅ RTC sincronizado exitosamente%s\n", ANSI_GREEN, ANSI_RESET);
+        Serial.printf("  %sFecha/Hora:%s %04d-%02d-%02d %02d:%02d:%02d\n",
+                     ANSI_GREEN, ANSI_RESET,
+                     timeinfo.tm_year + 1900,
+                     timeinfo.tm_mon + 1,
+                     timeinfo.tm_mday,
+                     timeinfo.tm_hour,
+                     timeinfo.tm_min,
+                     timeinfo.tm_sec);
+        Serial.printf("  %sTimestamp:%s %ld\n", ANSI_CYAN, ANSI_RESET, now);
+        Serial.printf("  %sDía de la semana:%s %s\n\n", ANSI_CYAN, ANSI_RESET, 
+                     timeinfo.tm_wday == 0 ? "Domingo" :
+                     timeinfo.tm_wday == 1 ? "Lunes" :
+                     timeinfo.tm_wday == 2 ? "Martes" :
+                     timeinfo.tm_wday == 3 ? "Miércoles" :
+                     timeinfo.tm_wday == 4 ? "Jueves" :
+                     timeinfo.tm_wday == 5 ? "Viernes" : "Sábado");
+        return true;
+    } else {
+        // Falló la sincronización
+        Serial.printf("\n  %s⚠️ No se pudo sincronizar con NTP%s\n", ANSI_YELLOW, ANSI_RESET);
+        Serial.printf("  %s→%s Usando millis() como fallback\n", ANSI_CYAN, ANSI_RESET);
+        Serial.printf("  %s→%s Verifica conectividad a Internet\n\n", ANSI_CYAN, ANSI_RESET);
+        return false;
+    }
+}
+
+// =============================================================================
+// FUNCIÓN AUXILIAR: Obtener timestamp actual del RTC
+// =============================================================================
+time_t getCurrentTimestamp() {
+    return time(nullptr);
+}
+
+// =============================================================================
+// FUNCIÓN AUXILIAR: Obtener hora formateada del RTC con zona horaria
+// =============================================================================
+void getCurrentTimeString(char* buffer, size_t bufferSize) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        snprintf(buffer, bufferSize, "%04d-%02d-%02dT%02d:%02d:%02d-03:00",
+                timeinfo.tm_year + 1900,
+                timeinfo.tm_mon + 1,
+                timeinfo.tm_mday,
+                timeinfo.tm_hour,
+                timeinfo.tm_min,
+                timeinfo.tm_sec);
+    } else {
+        snprintf(buffer, bufferSize, "N/A");
+    }
+}
+
+// =============================================================================
+// FUNCIÓN AUXILIAR: Obtener fuente de alimentación
+// =============================================================================
+const char* getPowerSource() {
+    // En ESP32-C3 podemos detectar si está en USB o batería
+    // Por ahora retornamos "USB" por defecto
+    // TODO: Implementar detección real si hay circuito de batería
+    return "USB";
+}
+
+// =============================================================================
+// FUNCIÓN AUXILIAR: Obtener razón del último reinicio
+// =============================================================================
+const char* getBootReason() {
+    esp_reset_reason_t reason = esp_reset_reason();
+    switch(reason) {
+        case ESP_RST_POWERON:   return "power_on";
+        case ESP_RST_SW:        return "software";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "watchdog";
+        case ESP_RST_TASK_WDT:  return "task_watchdog";
+        case ESP_RST_WDT:       return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep_sleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_SDIO:      return "sdio";
+        default:                return "unknown";
+    }
+}
+
+// =============================================================================
+// CALLBACK: Procesar mensajes MQTT entrantes (comandos)
+// =============================================================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    Serial.printf("\n%s[MQTT] Mensaje recibido:%s\n", ANSI_MAGENTA, ANSI_RESET);
+    Serial.printf("  %sTópico:%s %s\n", ANSI_CYAN, ANSI_RESET, topic);
+    
+    // Convertir payload a string
+    char message[256];
+    if (length >= sizeof(message)) {
+        length = sizeof(message) - 1;
+    }
+    memcpy(message, payload, length);
+    message[length] = '\0';
+    
+    Serial.printf("  %sPayload:%s %s\n", ANSI_CYAN, ANSI_RESET, message);
+    
+    // Parsear tópico para extraer comando
+    String topicStr = String(topic);
+    
+    // Ejemplo: devices/modbus-01/cmd/config
+    if (topicStr.endsWith("/cmd/config")) {
+        Serial.printf("  %s📝 Comando de configuración recibido%s\n", ANSI_GREEN, ANSI_RESET);
+        
+        // Parsear JSON simple (buscar "telemetry_interval")
+        String msg = String(message);
+        int idx = msg.indexOf("\"telemetry_interval\":");
+        if (idx != -1) {
+            int valueStart = idx + 21; // Longitud de "telemetry_interval":
+            int valueEnd = msg.indexOf(',', valueStart);
+            if (valueEnd == -1) valueEnd = msg.indexOf('}', valueStart);
+            
+            String valueStr = msg.substring(valueStart, valueEnd);
+            valueStr.trim();
+            unsigned long newInterval = valueStr.toInt();
+            
+            if (newInterval >= 1000 && newInterval <= 3600000) { // Entre 1s y 1h
+                mqttConfig.telemetryInterval = newInterval;
+                Serial.printf("  %s✅ Intervalo de telemetría actualizado a: %lu ms (%lu s)%s\n", 
+                             ANSI_GREEN, newInterval, newInterval/1000, ANSI_RESET);
+            } else {
+                Serial.printf("  %s❌ Intervalo fuera de rango (1000-3600000 ms)%s\n", ANSI_RED, ANSI_RESET);
+            }
+        }
+        
+        // Parsear "status_interval"
+        idx = msg.indexOf("\"status_interval\":");
+        if (idx != -1) {
+            int valueStart = idx + 18;
+            int valueEnd = msg.indexOf(',', valueStart);
+            if (valueEnd == -1) valueEnd = msg.indexOf('}', valueStart);
+            
+            String valueStr = msg.substring(valueStart, valueEnd);
+            valueStr.trim();
+            unsigned long newInterval = valueStr.toInt();
+            
+            if (newInterval >= 1000 && newInterval <= 3600000) {
+                mqttConfig.statusInterval = newInterval;
+                Serial.printf("  %s✅ Intervalo de estado actualizado a: %lu ms (%lu s)%s\n", 
+                             ANSI_GREEN, newInterval, newInterval/1000, ANSI_RESET);
+            } else {
+                Serial.printf("  %s❌ Intervalo fuera de rango (1000-3600000 ms)%s\n", ANSI_RED, ANSI_RESET);
+            }
+        }
+    }
+    else if (topicStr.endsWith("/cmd/reboot")) {
+        Serial.printf("  %s🔄 Comando de reinicio recibido - Reiniciando en 3s...%s\n", ANSI_YELLOW, ANSI_RESET);
+        delay(3000);
+        ESP.restart();
+    }
+    else if (topicStr.endsWith("/cmd/sensor_config")) {
+        Serial.printf("  %s🔧 Comando de configuración de sensores recibido%s\n", ANSI_GREEN, ANSI_RESET);
+        
+        // Ejemplo de payload completo (con parámetros Modbus):
+        // {"sensor_id":0,"type":"temperature","unit":"celsius","multiplier":0.1,"offset":0,"decimals":2,"modbus_function":3,"start_address":0,"register_count":1}
+        // {"sensor_id":0,"type":"energy","unit":"kWh","multiplier":0.001,"offset":0,"decimals":3,"modbus_function":4,"start_address":4096,"register_count":2}
+        // {"sensor_id":1,"type":"flow","unit":"m3/h","multiplier":0.01,"offset":0,"decimals":2,"modbus_function":3,"start_address":16,"register_count":1}
+        
+        String msg = String(message);
+        
+        // Con arquitectura de 1 sensor, no hay sensor_id
+        int idx;
+        
+        // Extraer type
+        idx = msg.indexOf("\"type\":\"");
+        if (idx != -1) {
+            int valueStart = idx + 8;
+            int valueEnd = msg.indexOf('\"', valueStart);
+            String type = msg.substring(valueStart, valueEnd);
+            type.toCharArray(sensorConfig.type, sizeof(sensorConfig.type));
+        }
+        
+        // Extraer unit
+        idx = msg.indexOf("\"unit\":\"");
+        if (idx != -1) {
+            int valueStart = idx + 8;
+            int valueEnd = msg.indexOf('\"', valueStart);
+            String unit = msg.substring(valueStart, valueEnd);
+            unit.toCharArray(sensorConfig.unit, sizeof(sensorConfig.unit));
+        }
+        
+        // Extraer multiplier
+        idx = msg.indexOf("\"multiplier\":");
+        if (idx != -1) {
+            int valueStart = idx + 13;
+            int valueEnd = msg.indexOf(',', valueStart);
+            if (valueEnd == -1) valueEnd = msg.indexOf('}', valueStart);
+            sensorConfig.multiplier = msg.substring(valueStart, valueEnd).toFloat();
+        }
+        
+        // Extraer offset
+        idx = msg.indexOf("\"offset\":");
+        if (idx != -1) {
+            int valueStart = idx + 9;
+            int valueEnd = msg.indexOf(',', valueStart);
+            if (valueEnd == -1) valueEnd = msg.indexOf('}', valueStart);
+            sensorConfig.offset = msg.substring(valueStart, valueEnd).toFloat();
+        }
+        
+        // Extraer decimals
+        idx = msg.indexOf("\"decimals\":");
+        if (idx != -1) {
+            int valueStart = idx + 11;
+            int valueEnd = msg.indexOf(',', valueStart);
+            if (valueEnd == -1) valueEnd = msg.indexOf('}', valueStart);
+            sensorConfig.decimals = msg.substring(valueStart, valueEnd).toInt();
+        }
+        
+        // ========== PARÁMETROS MODBUS ==========
+        
+        // Extraer modbus_function (0x03, 0x04, etc.)
+        idx = msg.indexOf("\"modbus_function\":");
+        if (idx != -1) {
+            int valueStart = idx + 18;
+            int valueEnd = msg.indexOf(',', valueStart);
+            if (valueEnd == -1) valueEnd = msg.indexOf('}', valueStart);
+            sensorConfig.modbusFunction = (uint8_t)msg.substring(valueStart, valueEnd).toInt();
+        }
+        
+        // Extraer start_address
+        idx = msg.indexOf("\"start_address\":");
+        if (idx != -1) {
+            int valueStart = idx + 16;
+            int valueEnd = msg.indexOf(',', valueStart);
+            if (valueEnd == -1) valueEnd = msg.indexOf('}', valueStart);
+            sensorConfig.registerStart = (uint16_t)msg.substring(valueStart, valueEnd).toInt();
+        }
+        
+        // Extraer register_count
+        idx = msg.indexOf("\"register_count\":");
+        if (idx != -1) {
+            int valueStart = idx + 17;
+            int valueEnd = msg.indexOf(',', valueStart);
+            if (valueEnd == -1) valueEnd = msg.indexOf('}', valueStart);
+            sensorConfig.registerCount = (uint16_t)msg.substring(valueStart, valueEnd).toInt();
+        }
+        
+        Serial.printf("  %s✅ Sensor reconfigurado:%s\n", ANSI_GREEN, ANSI_RESET);
+        Serial.printf("     Tipo: %s\n", sensorConfig.type);
+        Serial.printf("     Unidad: %s\n", sensorConfig.unit);
+        Serial.printf("     Multiplicador: %.4f\n", sensorConfig.multiplier);
+        Serial.printf("     Offset: %.2f\n", sensorConfig.offset);
+        Serial.printf("     Decimales: %d\n", sensorConfig.decimals);
+        Serial.printf("     %sModbus Función: 0x%02X%s\n", ANSI_CYAN, sensorConfig.modbusFunction, ANSI_RESET);
+        Serial.printf("     %sRegistro Inicial: %d%s\n", ANSI_CYAN, sensorConfig.registerStart, ANSI_RESET);
+        Serial.printf("     %sCantidad Registros: %d%s\n", ANSI_CYAN, sensorConfig.registerCount, ANSI_RESET);
+        // TODO: Guardar en EEPROM para persistencia
+    }
+    else if (topicStr.endsWith("/cmd/status")) {
+        Serial.printf("  %s📊 Solicitando publicación de estado inmediata%s\n", ANSI_CYAN, ANSI_RESET);
+        // TODO: Forzar publicación de estado
+    }
+    else {
+        Serial.printf("  %s⚠️ Comando desconocido%s\n", ANSI_YELLOW, ANSI_RESET);
+    }
+}
+
+// =============================================================================
+// TAREA 3: MQTT - Gestiona conexión WiFi y publicación MQTT
+// =============================================================================
+void mqttTask(void *pvParameters) {
+    Serial.println("[MQTT TASK] Iniciada");
+    
+    // Espera inicial para que el sistema se estabilice
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Variables para WiFi y MQTT (includes están al inicio del archivo)
+    WiFiClient espClient;
+    PubSubClient mqttClient(espClient);
+    
+    bool wifiConnected = false;
+    bool mqttConnected = false;
+    bool rtcSynced = false;
+    
+    const TickType_t checkInterval = pdMS_TO_TICKS(5000);   // Verifica conexión cada 5s
+    unsigned long lastPublish = 0;
+    unsigned long lastStatus = 0;
+    unsigned long lastRTCSync = 0;
+    const unsigned long rtcSyncInterval = 24 * 60 * 60 * 1000; // Re-sincronizar cada 24 horas
+    
+    // Inicializar configuración de intervalos (por defecto 60 segundos)
+    mqttConfig.telemetryInterval = 60000;  // 60 segundos
+    mqttConfig.statusInterval = 60000;     // 60 segundos
+    
+    Serial.printf("\n%s[MQTT CONFIG] Intervalos iniciales:%s\n", ANSI_CYAN, ANSI_RESET);
+    Serial.printf("  Telemetría: %lu ms (%lu s)\n", mqttConfig.telemetryInterval, mqttConfig.telemetryInterval/1000);
+    Serial.printf("  Estado: %lu ms (%lu s)\n", mqttConfig.statusInterval, mqttConfig.statusInterval/1000);
+    
+    // Construye los tópicos MQTT
+    buildMQTTTopics(wifiConfig.deviceId);
+    
+    // Intenta conectar WiFi
+    Serial.printf("\n%s[MQTT TASK] Conectando a WiFi...%s\n", ANSI_CYAN, ANSI_RESET);
+    Serial.printf("  SSID: %s%s%s\n", ANSI_BOLD, wifiConfig.ssid, ANSI_RESET);
+    WiFi.begin(wifiConfig.ssid, wifiConfig.password);
+    WiFi.setHostname(wifiConfig.deviceId);
+    
+    for (;;) {
+        // ============== GESTIÓN WiFi ==============
+        if (WiFi.status() != WL_CONNECTED) {
+            if (wifiConnected) {
+                Serial.printf("%s[MQTT TASK] WiFi desconectado, reconectando...%s\n", ANSI_YELLOW, ANSI_RESET);
+                mqttConnected = false;
+            }
+            wifiConnected = false;
+            WiFi.reconnect();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        if (!wifiConnected) {
+            wifiConnected = true;
+            Serial.printf("\n%s%s[MQTT TASK] ✓ WiFi conectado%s\n", ANSI_BOLD, ANSI_GREEN, ANSI_RESET);
+            Serial.printf("  %sIP:%s %s\n", ANSI_CYAN, ANSI_RESET, WiFi.localIP().toString().c_str());
+            Serial.printf("  %sRSSI:%s %d dBm\n", ANSI_CYAN, ANSI_RESET, WiFi.RSSI());
+            
+            // Sincronizar RTC con NTP al conectar WiFi
+            if (syncRTCWithNTP()) {
+                rtcSynced = true;
+                lastRTCSync = millis();
+            }
+        }
+        
+        // Re-sincronizar RTC cada 24 horas
+        if (rtcSynced && (millis() - lastRTCSync >= rtcSyncInterval)) {
+            Serial.printf("%s[RTC] Re-sincronizando después de 24 horas...%s\n", ANSI_CYAN, ANSI_RESET);
+            if (syncRTCWithNTP()) {
+                lastRTCSync = millis();
+            }
+        }
+        
+        // ============== GESTIÓN MQTT ==============
+        if (!mqttClient.connected()) {
+            if (mqttConnected) {
+                Serial.printf("%s[MQTT TASK] MQTT desconectado, reconectando...%s\n", ANSI_YELLOW, ANSI_RESET);
+                publishMQTTError("disconnected", "perdió conexión con broker", mqttClient.state());
+            }
+            mqttConnected = false;
+            
+            mqttClient.setServer(wifiConfig.mqttServer, wifiConfig.mqttPort);
+            mqttClient.setCallback(mqttCallback);  // Configurar callback para comandos
+            mqttClient.setBufferSize(1024);        // Aumentar buffer para payloads grandes
+            
+            // Conecta con usuario y contraseña
+            String clientId = String(wifiConfig.deviceId) + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+            
+            Serial.printf("\n%s[MQTT TASK] Intentando conectar al broker MQTT...%s\n", ANSI_CYAN, ANSI_RESET);
+            Serial.printf("  %sBroker:%s %s:%d\n", ANSI_CYAN, ANSI_RESET, wifiConfig.mqttServer, wifiConfig.mqttPort);
+            Serial.printf("  %sUsuario:%s %s\n", ANSI_CYAN, ANSI_RESET, wifiConfig.mqttUser);
+            Serial.printf("  %sClient ID:%s %s\n", ANSI_CYAN, ANSI_RESET, clientId.c_str());
+            
+            if (mqttClient.connect(clientId.c_str(), 
+                                  wifiConfig.mqttUser, 
+                                  wifiConfig.mqttPassword,
+                                  mqttTopics.status,  // Last Will Topic
+                                  1,                   // Last Will QoS
+                                  true,                // Last Will Retain
+                                  "{\"status\":\"offline\"}")) {
+                
+                mqttConnected = true;
+                Serial.printf("\n%s%s[MQTT TASK] ✅ MQTT CONECTADO EXITOSAMENTE%s\n", ANSI_BOLD, ANSI_GREEN, ANSI_RESET);
+                Serial.printf("  %sBroker:%s %s:%d\n", ANSI_GREEN, ANSI_RESET, wifiConfig.mqttServer, wifiConfig.mqttPort);
+                Serial.printf("  %sUsuario:%s %s\n", ANSI_GREEN, ANSI_RESET, wifiConfig.mqttUser);
+                Serial.printf("  %sClient ID:%s %s\n", ANSI_GREEN, ANSI_RESET, clientId.c_str());
+                
+                // Suscribirse a comandos
+                if (mqttClient.subscribe(mqttTopics.cmdBase)) {
+                    Serial.printf("  %s✓ Suscrito a:%s %s\n", ANSI_GREEN, ANSI_RESET, mqttTopics.cmdBase);
+                } else {
+                    Serial.printf("  %s✗ Error al suscribirse a:%s %s\n", ANSI_RED, ANSI_RESET, mqttTopics.cmdBase);
+                }
+                
+                // Publicar estado online con formato mejorado
+                char statusPayload[600];
+                char datetime[32];
+                if (rtcSynced) {
+                    getCurrentTimeString(datetime, sizeof(datetime));
+                } else {
+                    snprintf(datetime, sizeof(datetime), "no-sync");
+                }
+                unsigned long timestamp = rtcSynced ? getCurrentTimestamp() : millis();
+                
+                // Obtener información del sistema
+                uint8_t mac[6];
+                WiFi.macAddress(mac);
+                char macStr[18];
+                snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", 
+                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                
+                snprintf(statusPayload, sizeof(statusPayload),
+                        "{"
+                          "\"device_id\":\"%s\","
+                          "\"device_type\":\"modbus_sensor\","
+                          "\"timestamp\":%lu,"
+                          "\"datetime\":\"%s\","
+                          "\"event\":\"device_connected\","
+                          "\"network\":{"
+                            "\"ip\":\"%s\","
+                            "\"rssi\":%d,"
+                            "\"ssid\":\"%s\","
+                            "\"mac\":\"%s\""
+                          "},"
+                          "\"system\":{"
+                            "\"firmware\":\"%s\","
+                            "\"hardware\":\"ESP32-C3\","
+                            "\"chip_model\":\"%s\","
+                            "\"chip_revision\":%d,"
+                            "\"cpu_freq\":%u,"
+                            "\"flash_size\":%u,"
+                            "\"power_source\":\"%s\""
+                          "},"
+                          "\"boot\":{"
+                            "\"reason\":\"%s\","
+                            "\"rtc_synced\":%s"
+                          "}"
+                        "}",
+                        wifiConfig.deviceId,
+                        timestamp,
+                        datetime,
+                        WiFi.localIP().toString().c_str(),
+                        WiFi.RSSI(),
+                        wifiConfig.ssid,
+                        macStr,
+                        "1.0.0",
+                        ESP.getChipModel(),
+                        ESP.getChipRevision(),
+                        ESP.getCpuFreqMHz(),
+                        ESP.getFlashChipSize(),
+                        getPowerSource(),
+                        getBootReason(),
+                        rtcSynced ? "true" : "false"
+                        );
+                
+                // Publicar evento de conexión en topic específico
+                if (mqttClient.publish(mqttTopics.eventConnect, statusPayload, true)) {
+                    Serial.printf("  %s✓ Evento de conexión publicado en:%s %s\n", 
+                                 ANSI_GREEN, ANSI_RESET, mqttTopics.eventConnect);
+                } else {
+                    Serial.printf("  %s✗ Error al publicar evento de conexión%s\n", ANSI_RED, ANSI_RESET);
+                }
+                
+                // También publicar estado simple en topic de status
+                char simpleStatus[100];
+                snprintf(simpleStatus, sizeof(simpleStatus),
+                        "{\"status\":\"online\",\"timestamp\":%lu,\"datetime\":\"%s\"}",
+                        timestamp, datetime);
+                mqttClient.publish(mqttTopics.status, simpleStatus, true);
+                
+            } else {
+                // Conexión FALLIDA - Diagnóstico detallado
+                int8_t state = mqttClient.state();
+                Serial.printf("\n%s%s%s[MQTT TASK] ❌ CONEXIÓN MQTT RECHAZADA%s\n", ANSI_BG_RED, ANSI_BOLD, ANSI_WHITE, ANSI_RESET);
+                Serial.printf("  %sCódigo:%s %d\n", ANSI_RED, ANSI_RESET, state);
+                Serial.printf("  %sEstado:%s %s\n", ANSI_RED, ANSI_RESET, mqttStateToString(state));
+                Serial.printf("  %sBroker:%s %s:%d\n", ANSI_YELLOW, ANSI_RESET, wifiConfig.mqttServer, wifiConfig.mqttPort);
+                
+                // Diagnóstico específico según el error
+                switch(state) {
+                    case 1:
+                        Serial.printf("  %s🔍 Causa:%s Versión del protocolo MQTT no soportada por el broker\n", ANSI_MAGENTA, ANSI_RESET);
+                        Serial.printf("     %s→%s Verifica que Mosquitto soporte MQTT 3.1.1\n", ANSI_CYAN, ANSI_RESET);
+                        publishMQTTError("bad_protocol", "fue rechazado - protocolo MQTT no soportado", state);
+                        break;
+                    case 2:
+                        Serial.printf("  %s🔍 Causa:%s Client ID rechazado por el broker\n", ANSI_MAGENTA, ANSI_RESET);
+                        Serial.printf("     %s→%s Client ID usado: %s\n", ANSI_CYAN, ANSI_RESET, clientId.c_str());
+                        Serial.printf("     %s→%s El broker puede tener restricciones en Client IDs\n", ANSI_CYAN, ANSI_RESET);
+                        publishMQTTError("bad_client_id", "fue rechazado - Client ID inválido", state);
+                        break;
+                    case 3:
+                        Serial.printf("  %s🔍 Causa:%s Broker no disponible\n", ANSI_MAGENTA, ANSI_RESET);
+                        Serial.printf("     %s→%s Verifica que Mosquitto esté corriendo: %ssudo systemctl status mosquitto%s\n", ANSI_CYAN, ANSI_RESET, ANSI_BOLD, ANSI_RESET);
+                        Serial.printf("     %s→%s Verifica firewall y conectividad de red\n", ANSI_CYAN, ANSI_RESET);
+                        publishMQTTError("unavailable", "no pudo conectar - broker no disponible", state);
+                        break;
+                    case 4:
+                        Serial.printf("  %s%s🔍 Causa: CREDENCIALES INVÁLIDAS - ⚠️ ESP32 BLOQUEADO%s\n", ANSI_BOLD, ANSI_RED, ANSI_RESET);
+                        Serial.printf("     %s→%s Usuario: %s%s%s\n", ANSI_CYAN, ANSI_RESET, ANSI_BOLD, wifiConfig.mqttUser, ANSI_RESET);
+                        Serial.printf("     %s→%s La contraseña es incorrecta o el usuario no existe\n", ANSI_CYAN, ANSI_RESET);
+                        Serial.printf("     %s→%s Verifica /etc/mosquitto/passwd en la RPi\n", ANSI_CYAN, ANSI_RESET);
+                        Serial.printf("     %s→%s Comando: %ssudo mosquitto_passwd -c /etc/mosquitto/passwd mqttuser%s\n", ANSI_CYAN, ANSI_RESET, ANSI_BOLD, ANSI_RESET);
+                        publishMQTTError("blocked_credentials", "BLOQUEADO - credenciales inválidas", state);
+                        break;
+                    case 5:
+                        Serial.printf("  %s%s🔍 Causa: NO AUTORIZADO - ⚠️ ESP32 BLOQUEADO POR ACL%s\n", ANSI_BOLD, ANSI_RED, ANSI_RESET);
+                        Serial.printf("     %s→%s Usuario: %s%s%s autenticado pero sin permisos\n", ANSI_CYAN, ANSI_RESET, ANSI_BOLD, wifiConfig.mqttUser, ANSI_RESET);
+                        Serial.printf("     %s→%s Verifica ACL en /etc/mosquitto/acl.conf\n", ANSI_CYAN, ANSI_RESET);
+                        Serial.printf("     %s→%s El usuario puede no tener permiso para conectarse\n", ANSI_CYAN, ANSI_RESET);
+                        publishMQTTError("blocked_unauthorized", "BLOQUEADO - sin autorización ACL", state);
+                        break;
+                    case -4:
+                        Serial.printf("  %s🔍 Causa:%s Timeout de conexión\n", ANSI_MAGENTA, ANSI_RESET);
+                        Serial.printf("     %s→%s El broker no responde a tiempo\n", ANSI_CYAN, ANSI_RESET);
+                        Serial.printf("     %s→%s Verifica latencia de red o broker sobrecargado\n", ANSI_CYAN, ANSI_RESET);
+                        publishMQTTError("timeout", "timeout al conectar con broker", state);
+                        break;
+                    case -3:
+                        Serial.printf("  %s🔍 Causa:%s Conexión perdida\n", ANSI_MAGENTA, ANSI_RESET);
+                        Serial.printf("     %s→%s La conexión se perdió durante el handshake\n", ANSI_CYAN, ANSI_RESET);
+                        publishMQTTError("connection_lost", "perdió conexión durante handshake", state);
+                        break;
+                    case -2:
+                        Serial.printf("  %s🔍 Causa:%s Fallo general de conexión\n", ANSI_MAGENTA, ANSI_RESET);
+                        Serial.printf("     %s→%s Error de red o broker inaccesible\n", ANSI_CYAN, ANSI_RESET);
+                        publishMQTTError("connect_failed", "fallo general de conexión", state);
+                        break;
+                    default:
+                        Serial.printf("  %s🔍 Causa:%s Error desconocido (%d)\n", ANSI_MAGENTA, ANSI_RESET, state);
+                        publishMQTTError("unknown", "error desconocido al conectar", state);
+                        break;
+                }
+                
+                Serial.printf("\n  %s%s📋 CHECKLIST DE DIAGNÓSTICO:%s\n", ANSI_BOLD, ANSI_YELLOW, ANSI_RESET);
+                Serial.printf("     %s1.%s ¿Mosquitto está corriendo? %ssudo systemctl status mosquitto%s\n", ANSI_YELLOW, ANSI_RESET, ANSI_BOLD, ANSI_RESET);
+                Serial.printf("     %s2.%s ¿Usuario existe? %ssudo cat /etc/mosquitto/passwd%s\n", ANSI_YELLOW, ANSI_RESET, ANSI_BOLD, ANSI_RESET);
+                Serial.printf("     %s3.%s ¿Firewall permite puerto 1883? %ssudo ufw status%s\n", ANSI_YELLOW, ANSI_RESET, ANSI_BOLD, ANSI_RESET);
+                Serial.printf("     %s4.%s ¿IP correcta? %sping %s%s\n", ANSI_YELLOW, ANSI_RESET, ANSI_BOLD, wifiConfig.mqttServer, ANSI_RESET);
+                Serial.printf("     %s5.%s Prueba manual: %smosquitto_sub -h %s -p %d -u %s -P <password> -t '#'%s\n\n", 
+                              ANSI_YELLOW, ANSI_RESET, ANSI_BOLD, wifiConfig.mqttServer, wifiConfig.mqttPort, wifiConfig.mqttUser, ANSI_RESET);
+                
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+        }
+        
+        mqttClient.loop();
+        
+        // ============== Publicar telemetría con intervalo configurable ==============
+        if (millis() - lastPublish >= mqttConfig.telemetryInterval) {
+            lastPublish = millis();
+            
+            // MODO DE PRUEBA: Publica telemetría de sensores configurados
+            char payload[400];
+            unsigned long uptime = millis() / 1000;
+            unsigned long timestamp = rtcSynced ? getCurrentTimestamp() : millis();
+            char datetime[32];
+            if (rtcSynced) {
+                getCurrentTimeString(datetime, sizeof(datetime));
+            } else {
+                snprintf(datetime, sizeof(datetime), "no-sync");
+            }
+            
+            // Leer datos del sensor Modbus (protegido por mutex)
+            float sensorValue = 0.0;
+            bool isValid = false;
+            
+            if (dataMutex != NULL && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                if (sensorConfig.enabled && sensorData.valid && sensorData.registerCount > 0) {
+                    // Usamos el primer registro para el valor principal
+                    uint16_t rawValue = sensorData.registers[0];
+                    
+                    // Aplicar fórmula de conversión: (valor_raw * multiplier) + offset
+                    sensorValue = (rawValue * sensorConfig.multiplier) + sensorConfig.offset;
+                    isValid = true;
+                }
+                xSemaphoreGive(dataMutex);
+            }
+            
+            // Publicar telemetría del sensor único
+            if (!isValid) {
+                if (sensorConfig.enabled) {
+                    Serial.printf("  %s⚠️ Sensor (%s) sin datos válidos, omitiendo publicación%s\n", 
+                                 ANSI_YELLOW, sensorConfig.name, ANSI_RESET);
+                }
+            } else {
+                // Construir payload según configuración del sensor
+                char sensorPayload[400];
+                char valueStr[32];
+                
+                // Formatear valor con decimales configurados
+                dtostrf(sensorValue, 0, sensorConfig.decimals, valueStr);
+                
+                snprintf(sensorPayload, sizeof(sensorPayload), 
+                         "{"
+                           "\"device_id\":\"%s\","
+                           "\"device_type\":\"modbus_sensor\","
+                           "\"timestamp\":%lu,"
+                           "\"datetime\":\"%s\","
+                           "\"sensor\":{"
+                             "\"name\":\"%s\","
+                             "\"type\":\"%s\","
+                             "\"value\":%s,"
+                             "\"unit\":\"%s\","
+                             "\"modbus_address\":%d,"
+                             "\"register\":%d"
+                           "},"
+                           "\"meta\":{"
+                             "\"uptime\":%lu,"
+                             "\"rssi\":%d,"
+                             "\"firmware\":\"%s\","
+                             "\"power_source\":\"%s\""
+                           "}"
+                         "}",
+                         wifiConfig.deviceId,
+                         timestamp,
+                         datetime,
+                         sensorConfig.name,
+                         sensorConfig.type,
+                         valueStr,
+                         sensorConfig.unit,
+                         sensorConfig.modbusAddress,
+                         sensorConfig.registerStart,
+                         uptime,
+                         WiFi.RSSI(),
+                         "1.0.0",
+                         getPowerSource()
+                         );
+                
+                payload[0] = '\0';  // Limpiar buffer original
+                strncpy(payload, sensorPayload, sizeof(payload) - 1);
+                payload[sizeof(payload) - 1] = '\0';
+            
+                Serial.printf("\n%s[MQTT TASK] Publicando telemetría...%s\n", ANSI_CYAN, ANSI_RESET);
+                Serial.printf("  %sTópico:%s %s\n", ANSI_CYAN, ANSI_RESET, mqttTopics.telemetry);
+                Serial.printf("  %sSensor:%s %s (%s) = %s %s\n", ANSI_CYAN, ANSI_RESET, 
+                             sensorConfig.name,
+                             sensorConfig.type,
+                             valueStr,
+                             sensorConfig.unit);
+                Serial.printf("  %sIntervalo:%s %lu ms (%lu s)\n", ANSI_CYAN, ANSI_RESET, 
+                             mqttConfig.telemetryInterval, mqttConfig.telemetryInterval/1000);
+                Serial.printf("  %sPayload:%s %s\n", ANSI_CYAN, ANSI_RESET, payload);
+            
+                if (mqttClient.connected()) {
+                    bool pubOk = mqttClient.publish(mqttTopics.telemetry, payload);
+                    if (pubOk) {
+                        Serial.printf("  %s✅ Publicado correctamente%s\n", ANSI_GREEN, ANSI_RESET);
+                    } else {
+                        // Publicación FALLIDA
+                        int8_t state = mqttClient.state();
+                        Serial.printf("  %s%s❌ ERROR AL PUBLICAR%s\n", ANSI_BOLD, ANSI_RED, ANSI_RESET);
+                        Serial.printf("  %sEstado cliente:%s %d (%s)\n", ANSI_RED, ANSI_RESET, state, mqttStateToString(state));
+                        
+                        if (state == 0) {
+                            Serial.printf("  %s🔍%s Cliente muestra conectado pero publish falló\n", ANSI_MAGENTA, ANSI_RESET);
+                            Serial.printf("     %s→%s Buffer lleno o payload muy grande\n", ANSI_CYAN, ANSI_RESET);
+                            Serial.printf("     %s→%s Intenta aumentar MQTT_MAX_PACKET_SIZE\n", ANSI_CYAN, ANSI_RESET);
+                        } else {
+                            Serial.printf("  %s🔍%s Cliente desconectado durante publish\n", ANSI_MAGENTA, ANSI_RESET);
+                            publishMQTTError("publish_failed", "falló al publicar - cliente desconectado", state);
+                        }
+                    }
+                } else {
+                    Serial.printf("  %s⚠️ No se puede publicar: cliente MQTT no conectado%s\n", ANSI_YELLOW, ANSI_RESET);
+                    int8_t state = mqttClient.state();
+                    Serial.printf("  %sEstado:%s %d (%s)\n", ANSI_YELLOW, ANSI_RESET, state, mqttStateToString(state));
+                }
+            } // Fin del bloque de telemetría
+        }
+        
+        // ============== Publicar estado con intervalo configurable ==============
+        if (millis() - lastStatus >= mqttConfig.statusInterval) {
+            lastStatus = millis();
+            
+            char statusPayload[600];
+            unsigned long uptime = millis() / 1000;
+            unsigned long timestamp = rtcSynced ? getCurrentTimestamp() : millis();
+            char datetime[32];
+            if (rtcSynced) {
+                getCurrentTimeString(datetime, sizeof(datetime));
+            } else {
+                snprintf(datetime, sizeof(datetime), "no-sync");
+            }
+            
+            // Obtener MAC address
+            uint8_t mac[6];
+            WiFi.macAddress(mac);
+            char macStr[18];
+            snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", 
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            
+            snprintf(statusPayload, sizeof(statusPayload),
+                     "{"
+                       "\"device_id\":\"%s\","
+                       "\"device_type\":\"modbus_sensor\","
+                       "\"timestamp\":%lu,"
+                       "\"datetime\":\"%s\","
+                       "\"status\":\"online\","
+                       "\"network\":{"
+                         "\"ip\":\"%s\","
+                         "\"rssi\":%d,"
+                         "\"ssid\":\"%s\","
+                         "\"mac\":\"%s\""
+                       "},"
+                       "\"system\":{"
+                         "\"uptime\":%lu,"
+                         "\"heap_free\":%u,"
+                         "\"heap_total\":%u,"
+                         "\"cpu_freq\":%u,"
+                         "\"firmware\":\"%s\","
+                         "\"power_source\":\"%s\","
+                         "\"rtc_synced\":%s"
+                       "},"
+                       "\"modbus\":{"
+                         "\"status\":\"active\","
+                         "\"sensors_connected\":1,"
+                         "\"last_read\":%lu"
+                       "}"
+                     "}",
+                     wifiConfig.deviceId,
+                     timestamp,
+                     datetime,
+                     WiFi.localIP().toString().c_str(),
+                     WiFi.RSSI(),
+                     wifiConfig.ssid,
+                     macStr,
+                     uptime,
+                     ESP.getFreeHeap(),
+                     ESP.getHeapSize(),
+                     ESP.getCpuFreqMHz(),
+                     "1.0.0",
+                     getPowerSource(),
+                     rtcSynced ? "true" : "false",
+                     timestamp - 5  // Simulamos última lectura hace 5 segundos
+                     );
+            
+            Serial.printf("\n%s[MQTT TASK] Publicando estado...%s\n", ANSI_BLUE, ANSI_RESET);
+            Serial.printf("  %sIntervalo:%s %lu ms (%lu s)\n", ANSI_CYAN, ANSI_RESET, 
+                         mqttConfig.statusInterval, mqttConfig.statusInterval/1000);
+            Serial.printf("  %sPayload:%s %s\n", ANSI_CYAN, ANSI_RESET, statusPayload);
+            
+            if (mqttClient.connected()) {
+                bool pubOk = mqttClient.publish(mqttTopics.status, statusPayload, true);
+                if (pubOk) {
+                    Serial.printf("  %s✅ Estado publicado correctamente%s\n", ANSI_GREEN, ANSI_RESET);
+                } else {
+                    Serial.printf("  %s❌ Error al publicar estado%s\n", ANSI_RED, ANSI_RESET);
+                    int8_t state = mqttClient.state();
+                    Serial.printf("  %sEstado cliente:%s %d (%s)\n", ANSI_RED, ANSI_RESET, state, mqttStateToString(state));
+                    publishMQTTError("status_publish_failed", "falló al publicar estado", state);
+                }
+            }
+        }
+        
+        vTaskDelay(checkInterval);
+    }
+}
+
+// =============================================================================
+// TAREA 4: EEPROM - Gestiona lectura/escritura de EEPROM con API genérica
+// =============================================================================
+void eepromTask(void *pvParameters) {
+    Serial.println("[EEPROM TASK] Iniciada");
+    
+    EEPROMRequest request;
+    
+    // Intenta cargar configuración WiFi guardada
+    Serial.println("[EEPROM TASK] Cargando configuración WiFi...");
+    EEPROMStatus status = EEPROM24LC64.loadWithCRC<WiFiConfig>(EEPROM_ADDR_WIFI_CONFIG, wifiConfig);
+    
+    if (status == EEPROM_OK) {
+        Serial.println("[EEPROM TASK] ✓ Configuración WiFi cargada con CRC válido");
+        Serial.printf("  SSID: %s\n", wifiConfig.ssid);
+        Serial.printf("  Device ID: %s\n", wifiConfig.deviceId);
+        Serial.printf("  MQTT Server: %s:%d\n", wifiConfig.mqttServer, wifiConfig.mqttPort);
+        Serial.printf("  MQTT User: %s\n", wifiConfig.mqttUser);
+    } else {
+        Serial.println("[EEPROM TASK] No hay configuración guardada o CRC inválido, usando por defecto");
+        strcpy(wifiConfig.ssid, "MiWiFi");
+        strcpy(wifiConfig.password, "password123");
+        strcpy(wifiConfig.deviceId, "modbus-01");  // ID del dispositivo
+        strcpy(wifiConfig.mqttServer, "192.168.1.25");  // IP de tu RPi
+        wifiConfig.mqttPort = 1883;
+        strcpy(wifiConfig.mqttUser, "mqttuser");
+        strcpy(wifiConfig.mqttPassword, "1234");
+        
+        // Guarda configuración por defecto
+        EEPROM24LC64.saveWithCRC<WiFiConfig>(EEPROM_ADDR_WIFI_CONFIG, wifiConfig);
+        Serial.println("[EEPROM TASK] Configuración por defecto guardada");
+    }
+    
+    // Intenta cargar últimos datos del sensor
+    // NOTA: Con nueva arquitectura, no hay StoredSensorData
+    // TODO: Actualizar a nueva estructura si se necesita persistencia
+    Serial.println("[EEPROM TASK] Sistema de persistencia deshabilitado temporalmente");
+    
+    const TickType_t saveInterval = pdMS_TO_TICKS(60000); // Guarda cada 60 segundos
+    TickType_t lastSave = xTaskGetTickCount();
+    
+    for (;;) {
+        // Procesa comandos de la cola si hay
+        if (xQueueReceive(eepromQueue, &request, pdMS_TO_TICKS(100)) == pdTRUE) {
+            Serial.printf("[EEPROM TASK] Comando recibido: %d\n", request.command);
+            
+            switch (request.command) {
+                case EEPROM_CMD_WRITE_SENSOR_DATA:
+                    // Con arquitectura simplificada, no hay StoredSensorData
+                    Serial.println("[EEPROM TASK] WRITE_SENSOR_DATA no implementado en arquitectura simplificada");
+                    break;
+                    
+                case EEPROM_CMD_WRITE_CONFIG:
+                    // Guarda configuración WiFi con CRC
+                    status = EEPROM24LC64.saveWithCRC<WiFiConfig>(EEPROM_ADDR_WIFI_CONFIG, wifiConfig);
+                    if (status == EEPROM_OK) {
+                        Serial.println("[EEPROM TASK] ✓ Configuración WiFi guardada con CRC");
+                    } else {
+                        Serial.println("[EEPROM TASK] ✗ Error guardando configuración");
+                    }
+                    break;
+                    
+                default:
+                    Serial.println("[EEPROM TASK] Comando desconocido");
+                    break;
+            }
+        }
+        
+        // Guardado automático deshabilitado con arquitectura simplificada
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// =============================================================================
+// FUNCIÓN: Inicializa configuración WiFi/MQTT por defecto (sin EEPROM)
+// =============================================================================
+void initDefaultConfig() {
+    Serial.println("[CONFIG] Inicializando configuración por defecto (sin EEPROM)...");
+    
+    // Configuración WiFi/MQTT
+    strcpy(wifiConfig.ssid, "Amanda 2.4G");
+    strcpy(wifiConfig.password, "Gomezriquelmegomez12");
+    strcpy(wifiConfig.deviceId, "modbus-01");  // ID del dispositivo
+    strcpy(wifiConfig.mqttServer, "192.168.1.25");  // IP de tu RPi
+    wifiConfig.mqttPort = 1883;
+    strcpy(wifiConfig.mqttUser, "mqttuser");
+    strcpy(wifiConfig.mqttPassword, "1234");
+    
+    // Configuración de intervalos MQTT
+    mqttConfig.telemetryInterval = 10000;    // 10 segundos (telemetría decodificada, opcional)
+    mqttConfig.statusInterval = 60000;       // 60 segundos
+    mqttConfig.modbusRawInterval = 5000;     // 5 segundos (respuesta Modbus cruda)
+    
+    // Configuración de 1 solo sensor (múltiples registros)
+    strcpy(sensorConfig.name, "modbus_sensor");
+    strcpy(sensorConfig.type, "modbus_generic");
+    strcpy(sensorConfig.unit, "raw");
+    sensorConfig.modbusAddress = 1;
+    sensorConfig.modbusFunction = 0x03;  // Read Holding Registers
+    sensorConfig.registerStart = 0;
+    sensorConfig.registerCount = 10;     // Leer 10 registros por defecto
+    sensorConfig.multiplier = 1.0;       // Sin conversión por defecto
+    sensorConfig.offset = 0.0;
+    sensorConfig.decimals = 0;
+    sensorConfig.enabled = true;
+    
+    Serial.println("[CONFIG] ✓ Configuración cargada:");
+    Serial.printf("  SSID: %s\n", wifiConfig.ssid);
+    Serial.printf("  Device ID: %s\n", wifiConfig.deviceId);
+    Serial.printf("  MQTT Server: %s:%d\n", wifiConfig.mqttServer, wifiConfig.mqttPort);
+    Serial.printf("  MQTT User: %s\n", wifiConfig.mqttUser);
+    Serial.printf("  Sensor: %s (%s) - %d registros\n", 
+                 sensorConfig.name,
+                 sensorConfig.type,
+                 sensorConfig.registerCount);
+    Serial.printf("  Estado: %s\n", sensorConfig.enabled ? "habilitado" : "deshabilitado");
+    Serial.println();
+}
+
+// =============================================================================
+// Inicialización de tareas
+// =============================================================================
+void initTasks() {
+    Serial.println("Inicializando sistema de tareas FreeRTOS...");
+    
+    // Inicializa configuración por defecto (sin EEPROM)
+    initDefaultConfig();
+    
+    // Crea mutex para proteger datos compartidos
+    dataMutex = xSemaphoreCreateMutex();
+    if (dataMutex == NULL) {
+        Serial.println("ERROR: No se pudo crear dataMutex");
+        return;
+    }
+    
+    // ========== EEPROM DESHABILITADA ==========
+    // Crea cola para comandos de EEPROM
+    // eepromQueue = xQueueCreate(10, sizeof(EEPROMRequest));
+    // if (eepromQueue == NULL) {
+    //     Serial.println("ERROR: No se pudo crear eepromQueue");
+    //     return;
+    // }
+    // ==========================================
+    
+    // Inicializa datos compartidos
+    sensorData.modbusResponse.valid = false;
+    sensorData.modbusResponse.length = 0;
+    sensorData.modbusResponse.timestamp = 0;
+    sensorData.registerCount = 0;
+    sensorData.valid = false;
+    sensorData.timestamp = 0;
+    
+    // Crea tarea 1: Modbus
+    BaseType_t result1 = xTaskCreate(
+        modbusTask,           // Función de la tarea
+        "ModbusTask",         // Nombre
+        4096,                 // Stack size
+        NULL,                 // Parámetros
+        2,                    // Prioridad (2 = alta)
+        NULL                  // Handle
+    );
+    
+    if (result1 != pdPASS) {
+        Serial.println("ERROR: No se pudo crear ModbusTask");
+    } else {
+        Serial.println("✓ ModbusTask creada");
+    }
+    
+    // Crea tarea 2: Decoder
+    BaseType_t result2 = xTaskCreate(
+        decoderTask,          // Función de la tarea
+        "DecoderTask",        // Nombre
+        4096,                 // Stack size
+        NULL,                 // Parámetros
+        2,                    // Prioridad (2 = alta)
+        NULL                  // Handle
+    );
+    
+    if (result2 != pdPASS) {
+        Serial.println("ERROR: No se pudo crear DecoderTask");
+    } else {
+        Serial.println("✓ DecoderTask creada");
+    }
+    
+    // Crea tarea 3: MQTT
+    BaseType_t result3 = xTaskCreate(
+        mqttTask,             // Función de la tarea
+        "MQTT Task",          // Nombre
+        8192,                 // Stack size (más grande para WiFi/MQTT)
+        NULL,                 // Parámetros
+        1,                    // Prioridad (1 = media)
+        NULL                  // Handle
+    );
+    
+    if (result3 != pdPASS) {
+        Serial.println("ERROR: No se pudo crear MQTT Task");
+    } else {
+        Serial.println("✓ MQTT Task creada");
+    }
+    
+    // ========== EEPROM TASK DESHABILITADA ==========
+    // Crea tarea 4: EEPROM
+    // BaseType_t result4 = xTaskCreate(
+    //     eepromTask,           // Función de la tarea
+    //     "EEPROM Task",        // Nombre
+    //     4096,                 // Stack size
+    //     NULL,                 // Parámetros
+    //     1,                    // Prioridad (1 = media)
+    //     NULL                  // Handle
+    // );
+    // 
+    // if (result4 != pdPASS) {
+    //     Serial.println("ERROR: No se pudo crear EEPROM Task");
+    // } else {
+    //     Serial.println("✓ EEPROM Task creada");
+    // }
+    Serial.println("(EEPROM Task deshabilitada - sin hardware)");
+    // ===============================================
+    
+    Serial.println("Sistema de tareas inicializado correctamente");
+}

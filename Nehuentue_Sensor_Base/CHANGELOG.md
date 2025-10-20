@@ -1,4 +1,92 @@
-# Resumen de Cambios - EEPROM Ultra Genérica + Configuración MQTT + Arquitectura de Tópicos
+# Changelog - Gateway Modbus-MQTT ESP32
+
+## [2.0.0] - 19 de Octubre de 2025
+
+### 🎯 FEATURE PRINCIPAL: Configuración Modbus Dinámica Completa
+
+Sistema completamente reconfigurable sin necesidad de recompilar firmware. Ahora es posible cambiar no solo la interpretación de datos, sino también **qué comando Modbus se ejecuta**.
+
+#### ✨ Agregado
+
+- **Parámetros Modbus configurables vía MQTT**:
+  - `modbus_function`: Función Modbus (0x03, 0x04, etc.)
+  - `start_address`: Registro inicial a leer
+  - `register_count`: Cantidad de registros (1-4)
+  
+- **modbusTask() dinámico**:
+  - Loop que itera sobre `sensorsConfig.sensors[]`
+  - Ejecuta comandos Modbus según configuración de cada sensor
+  - Soporte para funciones 0x03 (Holding) y 0x04 (Input)
+  - Preparado para 0x01 (Coils) y 0x02 (Discrete)
+  
+- **decoderTask() flexible**:
+  - Procesa de 1 a 4 registros dinámicamente
+  - Almacena en array `registers[4]` por sensor
+  - Identifica sensor origen con `sensorIndex`
+  
+- **Estructura de datos multi-sensor**:
+  - `SingleSensorData` para almacenar hasta 4 registros
+  - `SensorData.sensors[4]` para múltiples sensores simultáneos
+  - Campos legacy mantenidos para compatibilidad
+  
+- **Documentación completa**:
+  - [`WEB_CONFIG.md`](WEB_CONFIG.md): Especificación de interfaz web futura
+  - [`RESUMEN_CAMBIOS_v2.0.md`](RESUMEN_CAMBIOS_v2.0.md): Resumen ejecutivo
+  - [`SENSOR_CONFIG.md`](SENSOR_CONFIG.md): Actualizado con nuevos parámetros
+
+#### 🔧 Modificado
+
+- **SensorConfig struct**: Agregado campo `modbusFunction`
+- **RawModbusData struct**: Agregado campo `sensorIndex`
+- **mqttCallback()**: Extendido para parsear parámetros Modbus
+- **initDefaultConfig()**: Incluye `modbusFunction = 0x03` por defecto
+
+#### 📋 Ejemplos de Uso
+
+**Medidor de Energía (Función 0x04, Registro 4096):**
+```bash
+mosquitto_pub -h 192.168.1.25 -t devices/modbus-01/cmd/sensor_config -m \
+'{
+  "sensor_id": 0,
+  "type": "energy",
+  "unit": "kWh",
+  "multiplier": 0.001,
+  "offset": 0,
+  "decimals": 3,
+  "modbus_function": 4,
+  "start_address": 4096,
+  "register_count": 2
+}'
+```
+
+**Flujómetro (Función 0x03, Registro 16):**
+```bash
+mosquitto_pub -h 192.168.1.25 -t devices/modbus-01/cmd/sensor_config -m \
+'{
+  "sensor_id": 1,
+  "type": "flow",
+  "unit": "m3/h",
+  "multiplier": 0.01,
+  "offset": 0,
+  "decimals": 2,
+  "modbus_function": 3,
+  "start_address": 16,
+  "register_count": 1
+}'
+```
+
+#### 🔜 Próximamente
+
+- Interfaz web embebida para configuración (ver [`WEB_CONFIG.md`](WEB_CONFIG.md))
+- Modo Access Point automático para primera configuración
+- Persistencia de configuración Modbus en EEPROM
+- Soporte para funciones Modbus 0x01, 0x02, 0x05, 0x06
+
+---
+
+## [1.5.0] - Octubre 2025
+
+### Resumen de Cambios - EEPROM Ultra Genérica + Configuración MQTT + Arquitectura de Tópicos
 
 ## ✅ Cambios Implementados
 

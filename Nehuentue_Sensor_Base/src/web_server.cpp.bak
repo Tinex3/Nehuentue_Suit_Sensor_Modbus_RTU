@@ -1,0 +1,960 @@
+#include "web_server.h"
+#include <WiFiManager.h>  // Para WiFiConfig
+#include <MQTTManager.h>  // Para MQTTConfig
+#include <SystemManager.h>  // Para SystemManager y SystemStatus
+#include "config.h"  // Para SensorConfig
+
+// Instancia del servidor web
+AsyncWebServer webServer(WEB_SERVER_PORT);
+WebServerMode currentWebMode = WEB_MODE_NONE;
+
+// Variables externas (se migrarán a usar managers)
+extern WiFiConfig wifiConfig;
+extern SensorConfig sensorConfig;  // 1 solo sensor (no array)
+extern MQTTConfig mqttConfig;
+
+// TODO: Migrar estas variables legacy de tasks.cpp a usar ModbusManager
+// extern SensorData sensorData;
+// extern SemaphoreHandle_t dataMutex;
+
+// ============================================================================
+// HTML PAGES (Minificado para ahorrar memoria)
+// ============================================================================
+
+const char HTML_HEADER[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gateway Modbus-MQTT</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:#f5f5f5;padding:20px}
+.container{max-width:800px;margin:0 auto}
+.card{background:#fff;border-radius:8px;padding:20px;margin:10px 0;box-shadow:0 2px 4px rgba(0,0,0,.1)}
+h1{color:#2196F3;margin-bottom:20px;font-size:24px}
+h2{color:#333;margin:20px 0 10px;font-size:18px}
+.status{display:flex;justify-content:space-between;align-items:center;padding:10px;margin:5px 0;background:#f9f9f9;border-radius:4px}
+.status-label{font-weight:bold;color:#666}
+.status-value{color:#333}
+.btn{display:inline-block;padding:10px 20px;margin:5px;background:#2196F3;color:#fff;border:none;border-radius:4px;cursor:pointer;text-decoration:none;font-size:14px}
+.btn:hover{background:#1976D2}
+.btn-danger{background:#F44336}
+.btn-danger:hover{background:#D32F2F}
+.btn-success{background:#4CAF50}
+.btn-success:hover{background:#388E3C}
+.btn-warning{background:#FF9800}
+.btn-warning:hover{background:#F57C00}
+.form-group{margin:15px 0}
+label{display:block;margin-bottom:5px;font-weight:bold;color:#666}
+input[type="text"],input[type="password"],input[type="number"],select{width:100%;padding:10px;border:1px solid #ddd;border-radius:4px;font-size:14px}
+.nav{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
+.sensor-item{background:#f9f9f9;padding:15px;margin:10px 0;border-radius:4px;border-left:4px solid #2196F3}
+.sensor-header{display:flex;justify-content:space-between;align-items:center}
+.sensor-info{font-size:14px;color:#666;margin-top:5px}
+.badge{display:inline-block;padding:4px 8px;background:#4CAF50;color:#fff;border-radius:4px;font-size:12px;margin-left:5px}
+.badge-disabled{background:#999}
+@media(max-width:600px){.status{flex-direction:column;align-items:flex-start}.btn{width:100%;text-align:center}}
+</style>
+</head>
+<body>
+<div class="container">
+)rawliteral";
+
+const char HTML_FOOTER[] PROGMEM = R"rawliteral(
+</div>
+<script>
+function reboot(){if(confirm('¿Reiniciar el dispositivo?')){fetch('/api/restart',{method:'POST'}).then(()=>alert('Reiniciando...'))}}
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================================
+// DASHBOARD PRINCIPAL
+// ============================================================================
+const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
+<div class="card">
+<h1>🌉 Gateway Modbus-MQTT</h1>
+<div class="nav">
+<a href="/" class="btn btn-success">Dashboard</a>
+<a href="/wifi" class="btn">WiFi</a>
+<a href="/mqtt" class="btn">MQTT</a>
+<a href="/sensors" class="btn">Sensores</a>
+<a href="/update" class="btn btn-warning">⚡ OTA Update</a>
+<button onclick="reboot()" class="btn btn-danger">Reiniciar</button>
+</div>
+</div>
+
+<div class="card">
+<h2>📊 Estado del Sistema</h2>
+<div id="status">Cargando...</div>
+</div>
+
+<script>
+function updateStatus(){
+  fetch('/api/status')
+    .then(r=>r.json())
+    .then(d=>{
+      let html='';
+      html+='<div class="status"><span class="status-label">WiFi:</span><span class="status-value">'+(d.wifi.connected?'🟢 '+d.wifi.ssid+' ('+d.wifi.rssi+' dBm)':'🔴 Desconectado')+'</span></div>';
+      html+='<div class="status"><span class="status-label">IP:</span><span class="status-value">'+d.wifi.ip+'</span></div>';
+      html+='<div class="status"><span class="status-label">MQTT:</span><span class="status-value">'+(d.mqtt.connected?'🟢 Conectado':'🔴 Desconectado')+'</span></div>';
+      html+='<div class="status"><span class="status-label">Server:</span><span class="status-value">'+d.mqtt.server+':'+d.mqtt.port+'</span></div>';
+      html+='<div class="status"><span class="status-label">Device ID:</span><span class="status-value">'+d.mqtt.device_id+'</span></div>';
+      html+='<div class="status"><span class="status-label">Uptime:</span><span class="status-value">'+Math.floor(d.system.uptime/1000)+' s</span></div>';
+      html+='<div class="status"><span class="status-label">Memoria:</span><span class="status-value">'+Math.floor(d.system.free_heap/1024)+' KB</span></div>';
+      html+='<div class="status"><span class="status-label">Firmware:</span><span class="status-value">'+d.system.firmware+'</span></div>';
+      
+      html+='<h2 style="margin-top:20px">🔌 Sensores Activos</h2>';
+      if(d.sensors && d.sensors.length>0){
+        d.sensors.forEach(s=>{
+          if(s.enabled){
+            html+='<div class="status"><span class="status-label">'+s.name+':</span><span class="status-value">'+s.last_value+' '+s.unit+'</span></div>';
+          }
+        });
+      }else{
+        html+='<div class="status"><span class="status-label">No hay sensores activos</span></div>';
+      }
+      
+      document.getElementById('status').innerHTML=html;
+    })
+    .catch(e=>document.getElementById('status').innerHTML='<div class="status">Error al cargar estado</div>');
+}
+updateStatus();
+setInterval(updateStatus,5000);
+</script>
+)rawliteral";
+
+// ============================================================================
+// PÁGINA CONFIGURACIÓN WIFI
+// ============================================================================
+const char HTML_WIFI[] PROGMEM = R"rawliteral(
+<div class="card">
+<h1>📡 Configuración WiFi</h1>
+<div class="nav">
+<a href="/" class="btn">Dashboard</a>
+<a href="/wifi" class="btn btn-success">WiFi</a>
+<a href="/mqtt" class="btn">MQTT</a>
+<a href="/sensors" class="btn">Sensores</a>
+</div>
+</div>
+
+<div class="card">
+<h2>Redes Disponibles</h2>
+<div id="networks">Escaneando...</div>
+<button onclick="scanNetworks()" class="btn">🔄 Escanear</button>
+</div>
+
+<div class="card">
+<h2>Configuración</h2>
+<form onsubmit="saveWiFi(event)">
+<div class="form-group">
+<label>SSID:</label>
+<input type="text" id="ssid" placeholder="Nombre de la red" required>
+</div>
+<div class="form-group">
+<label>Contraseña:</label>
+<div style="display:flex;gap:8px;align-items:center">
+<input type="password" id="password" placeholder="Contraseña WiFi" style="flex:1">
+<button type="button" onclick="togglePassword()" class="btn" style="padding:8px 12px;min-width:50px">👁️</button>
+</div>
+</div>
+<div class="form-group">
+<label>Device ID:</label>
+<input type="text" id="deviceId" placeholder="modbus-01" required>
+</div>
+<button type="submit" class="btn btn-success">💾 Guardar y Reiniciar</button>
+</form>
+</div>
+
+<script>
+function togglePassword(){
+  const input=document.getElementById('password');
+  const btn=event.target;
+  if(input.type==='password'){
+    input.type='text';
+    btn.textContent='🙈';
+  }else{
+    input.type='password';
+    btn.textContent='👁️';
+  }
+}
+function loadConfig(){
+  fetch('/api/config')
+    .then(r=>r.json())
+    .then(d=>{
+      document.getElementById('ssid').value=d.wifi.ssid||'';
+      document.getElementById('deviceId').value=d.wifi.device_id||'modbus-01';
+    });
+}
+function scanNetworks(){
+  document.getElementById('networks').innerHTML='Escaneando...';
+  
+  function pollScan(){
+    fetch('/api/scan')
+      .then(r=>r.json())
+      .then(d=>{
+        if(d.status==='scanning'||d.status==='started'){
+          // Escaneo en progreso, volver a consultar en 2 segundos
+          setTimeout(pollScan,2000);
+        }else if(d.status==='completed'){
+          // Mostrar resultados
+          let html='';
+          if(d.networks.length===0){
+            html='<div class="status">No se encontraron redes</div>';
+          }else{
+            d.networks.forEach(n=>{
+              html+='<div class="status" style="cursor:pointer" onclick="document.getElementById(\'ssid\').value=\''+n.ssid+'\'">';
+              html+='<span>'+n.ssid+' '+(n.encryption!='OPEN'?'🔒':'')+'</span>';
+              html+='<span>'+n.rssi+' dBm (Ch '+n.channel+')</span>';
+              html+='</div>';
+            });
+          }
+          document.getElementById('networks').innerHTML=html;
+        }
+      })
+      .catch(()=>document.getElementById('networks').innerHTML='Error al escanear');
+  }
+  
+  pollScan();
+}
+function saveWiFi(e){
+  e.preventDefault();
+  if(!confirm('¿Guardar configuración? El dispositivo se reiniciará.'))return;
+  const data={
+    wifi:{
+      ssid:document.getElementById('ssid').value,
+      password:document.getElementById('password').value,
+      device_id:document.getElementById('deviceId').value
+    }
+  };
+  fetch('/api/config',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(data)
+  })
+  .then(()=>{alert('Guardado. Reiniciando...'); setTimeout(()=>location.href='/',3000);})
+  .catch(()=>alert('Error al guardar'));
+}
+loadConfig();
+scanNetworks();
+</script>
+)rawliteral";
+
+// ============================================================================
+// PÁGINA CONFIGURACIÓN MQTT
+// ============================================================================
+const char HTML_MQTT[] PROGMEM = R"rawliteral(
+<div class="card">
+<h1>💬 Configuración MQTT</h1>
+<div class="nav">
+<a href="/" class="btn">Dashboard</a>
+<a href="/wifi" class="btn">WiFi</a>
+<a href="/mqtt" class="btn btn-success">MQTT</a>
+<a href="/sensors" class="btn">Sensores</a>
+</div>
+</div>
+
+<div class="card">
+<h2>Configuración del Broker</h2>
+<form onsubmit="saveMQTT(event)">
+<div class="form-group">
+<label>Servidor MQTT:</label>
+<input type="text" id="server" placeholder="192.168.1.25" required>
+</div>
+<div class="form-group">
+<label>Puerto:</label>
+<input type="number" id="port" placeholder="1883" required>
+</div>
+<div class="form-group">
+<label>Usuario:</label>
+<input type="text" id="user" placeholder="mqttuser">
+</div>
+<div class="form-group">
+<label>Contraseña:</label>
+<div style="display:flex;gap:8px;align-items:center">
+<input type="password" id="mqttPassword" placeholder="••••" style="flex:1">
+<button type="button" onclick="toggleMqttPassword()" class="btn" style="padding:8px 12px;min-width:50px">👁️</button>
+</div>
+</div>
+<h2>Intervalos (segundos)</h2>
+<div class="form-group">
+<label>Telemetría:</label>
+<input type="number" id="telemetryInterval" placeholder="60" min="1" max="3600" required>
+</div>
+<div class="form-group">
+<label>Estado:</label>
+<input type="number" id="statusInterval" placeholder="300" min="10" max="3600" required>
+</div>
+<button type="submit" class="btn btn-success">💾 Guardar</button>
+</form>
+</div>
+
+<script>
+function toggleMqttPassword(){
+  const input=document.getElementById('mqttPassword');
+  const btn=event.target;
+  if(input.type==='password'){
+    input.type='text';
+    btn.textContent='🙈';
+  }else{
+    input.type='password';
+    btn.textContent='👁️';
+  }
+}
+function loadConfig(){
+  fetch('/api/config')
+    .then(r=>r.json())
+    .then(d=>{
+      document.getElementById('server').value=d.mqtt.server||'';
+      document.getElementById('port').value=d.mqtt.port||1883;
+      document.getElementById('user').value=d.mqtt.user||'';
+      document.getElementById('telemetryInterval').value=d.mqtt.telemetry_interval||60;
+      document.getElementById('statusInterval').value=d.mqtt.status_interval||300;
+    });
+}
+function saveMQTT(e){
+  e.preventDefault();
+  const data={
+    mqtt:{
+      server:document.getElementById('server').value,
+      port:parseInt(document.getElementById('port').value),
+      user:document.getElementById('user').value,
+      password:document.getElementById('mqttPassword').value,
+      telemetry_interval:parseInt(document.getElementById('telemetryInterval').value),
+      status_interval:parseInt(document.getElementById('statusInterval').value)
+    }
+  };
+  fetch('/api/config',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(data)
+  })
+  .then(()=>alert('Guardado correctamente'))
+  .catch(()=>alert('Error al guardar'));
+}
+loadConfig();
+</script>
+)rawliteral";
+
+// ============================================================================
+// PÁGINA CONFIGURACIÓN SENSORES
+// ============================================================================
+const char HTML_SENSORS[] PROGMEM = R"rawliteral(
+<div class="card">
+<h1>🔌 Configuración del Sensor Modbus</h1>
+<div class="nav">
+<a href="/" class="btn">Dashboard</a>
+<a href="/wifi" class="btn">WiFi</a>
+<a href="/mqtt" class="btn">MQTT</a>
+<a href="/sensors" class="btn btn-success">Sensores</a>
+</div>
+</div>
+
+<div class="card">
+<h2>Estado Actual del Sensor</h2>
+<div id="sensorStatus">Cargando...</div>
+</div>
+
+<div class="card">
+<h2>Configuración Modbus</h2>
+<form onsubmit="saveSensor(event)">
+<div class="form-group">
+<label>Nombre del Sensor:</label>
+<input type="text" id="name" placeholder="Mi Sensor Modbus" maxlength="31">
+</div>
+<div class="form-group">
+<label>Tipo:</label>
+<select id="type" required>
+<option value="temperature">Temperature</option>
+<option value="humidity">Humidity</option>
+<option value="energy">Energy</option>
+<option value="power">Power</option>
+<option value="voltage">Voltage</option>
+<option value="current">Current</option>
+<option value="flow">Flow</option>
+<option value="pressure">Pressure</option>
+<option value="level">Level</option>
+<option value="speed">Speed</option>
+<option value="custom">Custom</option>
+<option value="modbus_generic">Modbus Generic</option>
+</select>
+</div>
+<div class="form-group">
+<label>Unidad:</label>
+<input type="text" id="unit" placeholder="celsius, kWh, bar..." maxlength="15" required>
+</div>
+<div class="form-group">
+<label>Función Modbus:</label>
+<select id="modbusFunction" required>
+<option value="3">0x03 - Read Holding Registers</option>
+<option value="4">0x04 - Read Input Registers</option>
+</select>
+</div>
+<div class="form-group">
+<label>Dirección Esclavo (1-247):</label>
+<input type="number" id="modbusAddress" min="1" max="247" placeholder="1" required>
+</div>
+<div class="form-group">
+<label>Registro Inicial:</label>
+<input type="number" id="registerStart" min="0" max="65535" placeholder="0" required>
+</div>
+<div class="form-group">
+<label>Cantidad de Registros (1-125):</label>
+<input type="number" id="registerCount" min="1" max="125" placeholder="10" required>
+<small style="color:#666;font-size:12px">💡 Puedes leer hasta 125 registros (250 bytes) en una consulta</small>
+</div>
+<div class="form-group">
+<label>Multiplicador:</label>
+<input type="number" id="multiplier" step="0.0001" placeholder="1.0" required>
+<small style="color:#666;font-size:12px">Fórmula: Valor = (Raw × Multiplicador) + Offset</small>
+</div>
+<div class="form-group">
+<label>Offset:</label>
+<input type="number" id="offset" step="0.01" placeholder="0" required>
+</div>
+<div class="form-group">
+<label>Decimales (0-6):</label>
+<input type="number" id="decimals" min="0" max="6" placeholder="2" required>
+</div>
+<div class="form-group">
+<label><input type="checkbox" id="enabled"> Sensor habilitado</label>
+</div>
+<button type="submit" class="btn btn-success">💾 Guardar Configuración</button>
+</form>
+</div>
+
+<script>
+function loadSensor(){
+  fetch('/api/config')
+    .then(r=>r.json())
+    .then(d=>{
+      const s=d.sensor;
+      if(s){
+        // Cargar datos en formulario
+        document.getElementById('name').value=s.name||'';
+        document.getElementById('type').value=s.type||'modbus_generic';
+        document.getElementById('unit').value=s.unit||'';
+        document.getElementById('modbusFunction').value=s.modbus_function||3;
+        document.getElementById('modbusAddress').value=s.modbus_address||1;
+        document.getElementById('registerStart').value=s.register_start||0;
+        document.getElementById('registerCount').value=s.register_count||10;
+        document.getElementById('multiplier').value=s.multiplier||1.0;
+        document.getElementById('offset').value=s.offset||0;
+        document.getElementById('decimals').value=s.decimals||2;
+        document.getElementById('enabled').checked=s.enabled!==false;
+        
+        // Mostrar estado
+        let statusHtml='<div class="sensor-item">';
+        statusHtml+='<div class="sensor-header">';
+        statusHtml+='<span><strong>'+(s.name||'Sensor Modbus')+':</strong> '+s.type+' '+(s.enabled?'<span class="badge">✓ Activo</span>':'<span class="badge badge-disabled">✗ Inactivo</span>')+'</span>';
+        statusHtml+='</div>';
+        statusHtml+='<div class="sensor-info">📊 Unidad: <strong>'+s.unit+'</strong> | Función: <strong>0x'+(s.modbus_function||3).toString(16).toUpperCase()+'</strong> | Esclavo: <strong>'+s.modbus_address+'</strong></div>';
+        statusHtml+='<div class="sensor-info">📍 Registro: <strong>'+s.register_start+'</strong> | Cantidad: <strong>'+s.register_count+' registros</strong></div>';
+        statusHtml+='<div class="sensor-info">🧮 Fórmula: <code>Valor = (Raw × '+s.multiplier+') + '+s.offset+'</code></div>';
+        statusHtml+='</div>';
+        document.getElementById('sensorStatus').innerHTML=statusHtml;
+      }else{
+        document.getElementById('sensorStatus').innerHTML='<div class="status">⚠️ No se pudo cargar la configuración</div>';
+      }
+    })
+    .catch(()=>{
+      document.getElementById('sensorStatus').innerHTML='<div class="status">❌ Error al cargar configuración</div>';
+    });
+}
+
+function saveSensor(e){
+  e.preventDefault();
+  const data={
+    name:document.getElementById('name').value,
+    type:document.getElementById('type').value,
+    unit:document.getElementById('unit').value,
+    modbus_function:parseInt(document.getElementById('modbusFunction').value),
+    modbus_address:parseInt(document.getElementById('modbusAddress').value),
+    start_address:parseInt(document.getElementById('registerStart').value),
+    register_count:parseInt(document.getElementById('registerCount').value),
+    multiplier:parseFloat(document.getElementById('multiplier').value),
+    offset:parseFloat(document.getElementById('offset').value),
+    decimals:parseInt(document.getElementById('decimals').value),
+    enabled:document.getElementById('enabled').checked
+  };
+  
+  fetch('/api/sensors',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(data)
+  })
+  .then(r=>{
+    if(r.ok){
+      alert('✅ Sensor guardado correctamente\n\nLa configuración se aplicará en la próxima lectura Modbus.');
+      loadSensor();
+    }else{
+      alert('❌ Error al guardar la configuración');
+    }
+  })
+  .catch(()=>alert('❌ Error de red al guardar'));
+}
+
+loadSensor();
+</script>
+)rawliteral";
+
+// ============================================================================
+// FUNCIONES DE INICIALIZACIÓN
+// ============================================================================
+
+String getAPSSID() {
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char ssid[32];
+    snprintf(ssid, sizeof(ssid), "%s%02X%02X", AP_SSID_PREFIX, mac[4], mac[5]);
+    return String(ssid);
+}
+
+void initWebServer() {
+    Serial.println("[WEB SERVER] Inicializando servidor web...");
+    
+    // Ruta principal - Dashboard
+    webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        String html = String(HTML_HEADER) + String(HTML_DASHBOARD) + String(HTML_FOOTER);
+        request->send(200, "text/html", html);
+    });
+    
+    // Página WiFi
+    webServer.on("/wifi", HTTP_GET, [](AsyncWebServerRequest *request){
+        String html = String(HTML_HEADER) + String(HTML_WIFI) + String(HTML_FOOTER);
+        request->send(200, "text/html", html);
+    });
+    
+    // Página MQTT
+    webServer.on("/mqtt", HTTP_GET, [](AsyncWebServerRequest *request){
+        String html = String(HTML_HEADER) + String(HTML_MQTT) + String(HTML_FOOTER);
+        request->send(200, "text/html", html);
+    });
+    
+    // Página Sensores
+    webServer.on("/sensors", HTTP_GET, [](AsyncWebServerRequest *request){
+        String html = String(HTML_HEADER) + String(HTML_SENSORS) + String(HTML_FOOTER);
+        request->send(200, "text/html", html);
+    });
+    
+    // API: Status
+    webServer.on("/api/status", HTTP_GET, handleStatus);
+    
+    // API: Config GET
+    webServer.on("/api/config", HTTP_GET, handleConfig);
+    
+    // API: Config POST
+    webServer.on("/api/config", HTTP_POST, 
+        [](AsyncWebServerRequest *request){},
+        NULL,
+        handleConfigPost
+    );
+    
+    // API: Sensors POST
+    webServer.on("/api/sensors", HTTP_POST,
+        [](AsyncWebServerRequest *request){},
+        NULL,
+        handleSensorConfig
+    );
+    
+    // API: WiFi Scan
+    webServer.on("/api/scan", HTTP_GET, handleWiFiScan);
+    
+    // API: Restart
+    webServer.on("/api/restart", HTTP_POST, handleRestart);
+    
+    // Favicon (evitar error 404)
+    webServer.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send(204);  // No Content
+    });
+    
+    // Capturar errores 404
+    webServer.onNotFound([](AsyncWebServerRequest *request){
+        Serial.printf("[WEB SERVER] 404: %s\n", request->url().c_str());
+        request->send(404, "text/plain", "Not Found");
+    });
+    
+    Serial.println("[WEB SERVER] Rutas configuradas");
+    
+    // Iniciar servidor web
+    webServer.begin();
+    Serial.println("[WEB SERVER] ✓ Servidor web iniciado");
+}
+
+void startAPMode() {
+    Serial.println("[WEB SERVER] Iniciando modo Access Point...");
+    
+    String ssid = getAPSSID();
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(ssid.c_str(), AP_PASSWORD);
+    
+    IPAddress IP = WiFi.softAPIP();
+    Serial.printf("[WEB SERVER] AP iniciado: %s\n", ssid.c_str());
+    Serial.printf("[WEB SERVER] Contraseña: %s\n", AP_PASSWORD);
+    Serial.printf("[WEB SERVER] IP: %s\n", IP.toString().c_str());
+    Serial.printf("[WEB SERVER] Accede a: http://%s\n", IP.toString().c_str());
+    
+    webServer.begin();
+    currentWebMode = WEB_MODE_AP;
+    
+    Serial.println("[WEB SERVER] Servidor web activo en modo AP");
+}
+
+void startSTAMode() {
+    Serial.println("[WEB SERVER] Iniciando servidor web en modo STA...");
+    
+    webServer.begin();
+    currentWebMode = WEB_MODE_STA;
+    
+    Serial.printf("[WEB SERVER] Servidor activo en http://%s\n", WiFi.localIP().toString().c_str());
+}
+
+void stopWebServer() {
+    Serial.println("[WEB SERVER] Deteniendo servidor web...");
+    webServer.end();
+    currentWebMode = WEB_MODE_NONE;
+}
+
+// ============================================================================
+// HANDLERS DE LA API REST
+// ============================================================================
+
+void handleStatus(AsyncWebServerRequest *request) {
+    Serial.println("[WEB API] GET /api/status");
+    String json = getSystemStatusJSON();
+    request->send(200, "application/json", json);
+}
+
+void handleConfig(AsyncWebServerRequest *request) {
+    Serial.println("[WEB API] GET /api/config");
+    String json = getConfigJSON();
+    request->send(200, "application/json", json);
+}
+
+void handleConfigPost(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+    Serial.println("[WEB API] POST /api/config");
+    
+    // Buffer estático para acumular datos
+    static String bodyBuffer = "";
+    
+    // Primera parte de los datos
+    if (index == 0) {
+        bodyBuffer = "";
+    }
+    
+    // Acumular datos
+    for (size_t i = 0; i < len; i++) {
+        bodyBuffer += (char)data[i];
+    }
+    
+    // Si recibimos todos los datos
+    if (index + len == total) {
+        Serial.printf("[WEB API] Body completo: %s\n", bodyBuffer.c_str());
+        
+        StaticJsonDocument<1024> doc;
+        DeserializationError error = deserializeJson(doc, bodyBuffer);
+        
+        if (error) {
+            Serial.printf("[WEB API] Error al parsear JSON: %s\n", error.c_str());
+            request->send(400, "application/json", "{\"error\":\"JSON inválido\"}");
+            return;
+        }
+        
+        bool needsRestart = false;
+        
+        // Actualizar configuración WiFi
+        if (doc.containsKey("wifi")) {
+            if (doc["wifi"].containsKey("ssid")) {
+                strncpy(wifiConfig.ssid, doc["wifi"]["ssid"], sizeof(wifiConfig.ssid) - 1);
+                needsRestart = true;
+            }
+            if (doc["wifi"].containsKey("password")) {
+                strncpy(wifiConfig.password, doc["wifi"]["password"], sizeof(wifiConfig.password) - 1);
+                needsRestart = true;
+            }
+            if (doc["wifi"].containsKey("hostname")) {
+                strncpy(wifiConfig.hostname, doc["wifi"]["hostname"], sizeof(wifiConfig.hostname) - 1);
+            }
+            Serial.println("[WEB API] Configuración WiFi actualizada");
+        }
+        
+        // Actualizar configuración MQTT
+        if (doc.containsKey("mqtt")) {
+            if (doc["mqtt"].containsKey("server")) {
+                strncpy(mqttConfig.server, doc["mqtt"]["server"], sizeof(mqttConfig.server) - 1);
+            }
+            if (doc["mqtt"].containsKey("port")) {
+                mqttConfig.port = doc["mqtt"]["port"];
+            }
+            if (doc["mqtt"].containsKey("user")) {
+                strncpy(mqttConfig.user, doc["mqtt"]["user"], sizeof(mqttConfig.user) - 1);
+            }
+            if (doc["mqtt"].containsKey("password") && doc["mqtt"]["password"].as<String>().length() > 0) {
+                strncpy(mqttConfig.password, doc["mqtt"]["password"], sizeof(mqttConfig.password) - 1);
+            }
+            if (doc["mqtt"].containsKey("client_id")) {
+                strncpy(mqttConfig.clientId, doc["mqtt"]["client_id"], sizeof(mqttConfig.clientId) - 1);
+            }
+            Serial.println("[WEB API] Configuración MQTT actualizada");
+        }
+        
+        // TODO: Guardar en EEPROM
+        
+        String response = "{\"success\":true,\"message\":\"Configuración guardada\"";
+        if (needsRestart) {
+            response += ",\"restart\":true}";
+            request->send(200, "application/json", response);
+            delay(1000);
+            ESP.restart();
+        } else {
+            response += "}";
+            request->send(200, "application/json", response);
+        }
+        
+        bodyBuffer = "";  // Limpiar buffer
+    }
+}
+
+void handleSensorConfig(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+    Serial.println("[WEB API] POST /api/sensors");
+    
+    static String bodyBuffer = "";
+    
+    if (index == 0) {
+        bodyBuffer = "";
+    }
+    
+    for (size_t i = 0; i < len; i++) {
+        bodyBuffer += (char)data[i];
+    }
+    
+    if (index + len == total) {
+        Serial.printf("[WEB API] Body: %s\n", bodyBuffer.c_str());
+        
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, bodyBuffer);
+        
+        if (error) {
+            request->send(400, "application/json", "{\"error\":\"JSON inválido\"}");
+            return;
+        }
+        
+        // Actualizar configuración del sensor (ya no hay sensor_id, solo 1 sensor)
+        if (doc.containsKey("name")) {
+            strncpy(sensorConfig.name, doc["name"], sizeof(sensorConfig.name) - 1);
+        }
+        if (doc.containsKey("type")) {
+            strncpy(sensorConfig.type, doc["type"], sizeof(sensorConfig.type) - 1);
+        }
+        if (doc.containsKey("unit")) {
+            strncpy(sensorConfig.unit, doc["unit"], sizeof(sensorConfig.unit) - 1);
+        }
+        if (doc.containsKey("modbus_function")) {
+            sensorConfig.modbusFunction = doc["modbus_function"];
+        }
+        if (doc.containsKey("modbus_address")) {
+            sensorConfig.modbusAddress = doc["modbus_address"];
+        }
+        if (doc.containsKey("start_address")) {
+            sensorConfig.registerStart = doc["start_address"];
+        }
+        if (doc.containsKey("register_count")) {
+            sensorConfig.registerCount = doc["register_count"];
+        }
+        if (doc.containsKey("multiplier")) {
+            sensorConfig.multiplier = doc["multiplier"];
+        }
+        if (doc.containsKey("offset")) {
+            sensorConfig.offset = doc["offset"];
+        }
+        if (doc.containsKey("decimals")) {
+            sensorConfig.decimals = doc["decimals"];
+        }
+        if (doc.containsKey("enabled")) {
+            sensorConfig.enabled = doc["enabled"];
+        }
+        
+        Serial.printf("[WEB API] Sensor configurado: %s (%s) - %d registros\n", 
+                     sensorConfig.type,
+                     sensorConfig.unit,
+                     sensorConfig.registerCount);
+        
+        // TODO: Guardar en EEPROM
+        
+        request->send(200, "application/json", "{\"success\":true}");
+        bodyBuffer = "";
+    }
+}
+
+void handleWiFiScan(AsyncWebServerRequest *request) {
+    Serial.println("[WEB API] GET /api/scan - Escaneando redes WiFi...");
+    
+    // Verificar si hay un escaneo en progreso
+    int16_t n = WiFi.scanComplete();
+    
+    if (n == WIFI_SCAN_RUNNING) {
+        // Escaneo en progreso
+        request->send(202, "application/json", "{\"status\":\"scanning\"}");
+        return;
+    }
+    
+    if (n == WIFI_SCAN_FAILED || n < 0) {
+        // Iniciar nuevo escaneo (asíncrono)
+        WiFi.scanNetworks(true);  // true = asíncrono
+        request->send(202, "application/json", "{\"status\":\"started\"}");
+        return;
+    }
+    
+    // Escaneo completado, devolver resultados
+    String json = "{\"status\":\"completed\",\"networks\":[";
+    for (int i = 0; i < n; i++) {
+        if (i > 0) json += ",";
+        json += "{";
+        json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+        json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+        json += "\"encryption\":\"" + String(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "ENCRYPTED") + "\",";
+        json += "\"channel\":" + String(WiFi.channel(i));
+        json += "}";
+    }
+    json += "]}";
+    
+    Serial.printf("[WEB API] Encontradas %d redes\n", n);
+    
+    // Limpiar resultados del escaneo
+    WiFi.scanDelete();
+    
+    request->send(200, "application/json", json);
+}
+
+void handleRestart(AsyncWebServerRequest *request) {
+    Serial.println("[WEB API] POST /api/restart - Reiniciando...");
+    request->send(200, "application/json", "{\"success\":true,\"message\":\"Reiniciando en 2 segundos\"}");
+    delay(2000);
+    ESP.restart();
+}
+
+// ============================================================================
+// UTILIDADES
+// ============================================================================
+
+String getSystemStatusJSON() {
+    StaticJsonDocument<1536> doc;  // Aumentado para más datos
+    
+    // Obtener información del SystemManager
+    extern SystemManager SysMgr;
+    SystemStatus sysStatus = SysMgr.getStatus();
+    
+    // System - Información básica
+    doc["system"]["uptime"] = sysStatus.uptime;
+    doc["system"]["firmware"] = sysStatus.firmwareVersion;
+    doc["system"]["chip_model"] = sysStatus.chipModel;
+    doc["system"]["chip_revision"] = sysStatus.chipRevision;
+    doc["system"]["mac"] = SysMgr.getChipId();
+    
+    // System - CPU
+    doc["system"]["cpu"]["freq_mhz"] = sysStatus.cpuFreqMHz;
+    doc["system"]["cpu"]["cores"] = 1;  // ESP32-C3 tiene 1 core
+    
+    // System - RAM (usando ESP-IDF APIs para información precisa)
+    uint32_t totalRam, freeRam, usedRam, minFreeRam, largestBlock;
+    SysMgr.getMemoryInfo(totalRam, freeRam, usedRam, minFreeRam, largestBlock);
+    
+    float ramUsagePercent = (usedRam * 100.0f) / totalRam;
+    
+    doc["system"]["ram"]["total"] = totalRam;
+    doc["system"]["ram"]["used"] = usedRam;
+    doc["system"]["ram"]["free"] = freeRam;
+    doc["system"]["ram"]["min_free"] = minFreeRam;
+    doc["system"]["ram"]["largest_block"] = largestBlock;
+    doc["system"]["ram"]["usage_percent"] = (int)ramUsagePercent;
+    
+    // System - Flash (usando ESP-IDF APIs para información precisa)
+    uint32_t totalFlash, usedFlash, freeFlash, appSize, otaSize;
+    SysMgr.getFlashInfo(totalFlash, usedFlash, freeFlash, appSize, otaSize);
+    
+    float flashUsagePercent = (usedFlash * 100.0f) / totalFlash;
+    
+    doc["system"]["flash"]["total"] = totalFlash;
+    doc["system"]["flash"]["used"] = usedFlash;
+    doc["system"]["flash"]["free"] = freeFlash;
+    doc["system"]["flash"]["app_size"] = appSize;
+    doc["system"]["flash"]["ota_size"] = otaSize;
+    doc["system"]["flash"]["usage_percent"] = (int)flashUsagePercent;
+    
+    // WiFi
+    doc["wifi"]["connected"] = sysStatus.wifiConnected;
+    doc["wifi"]["ssid"] = wifiConfig.ssid;
+    doc["wifi"]["ip"] = WiFi.localIP().toString();
+    doc["wifi"]["rssi"] = WiFi.RSSI();
+    
+    // MQTT - Usar MqttMgr para obtener estado real
+    extern MQTTManager MqttMgr;
+    doc["mqtt"]["connected"] = sysStatus.mqttConnected || MqttMgr.isConnected();
+    doc["mqtt"]["server"] = mqttConfig.server;
+    doc["mqtt"]["port"] = mqttConfig.port;
+    doc["mqtt"]["client_id"] = mqttConfig.clientId;
+    
+    // Sensor (solo 1)
+    JsonObject sensor = doc.createNestedObject("sensor");
+    sensor["name"] = sensorConfig.name;
+    sensor["type"] = sensorConfig.type;
+    sensor["enabled"] = sensorConfig.enabled;
+    sensor["register_count"] = sensorConfig.registerCount;
+    
+    // TODO: Obtener último valor del sensor usando ModbusManager
+    // (código legacy comentado temporalmente)
+    /*
+    int lastValue = 0;
+    if (dataMutex != NULL && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (sensorData.valid && sensorData.registerCount > 0) {
+            lastValue = sensorData.registers[0];
+        }
+        xSemaphoreGive(dataMutex);
+    }
+    sensor["last_value"] = lastValue;
+    */
+    sensor["last_value"] = 0;  // Placeholder hasta implementar con ModbusManager
+    sensor["unit"] = sensorConfig.unit;
+    sensor["timestamp"] = millis();
+    
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
+
+String getConfigJSON() {
+    StaticJsonDocument<2048> doc;
+    
+    // WiFi
+    doc["wifi"]["ssid"] = wifiConfig.ssid;
+    doc["wifi"]["hostname"] = wifiConfig.hostname;
+    // No enviar password por seguridad
+    
+    // MQTT
+    doc["mqtt"]["server"] = mqttConfig.server;
+    doc["mqtt"]["port"] = mqttConfig.port;
+    doc["mqtt"]["user"] = mqttConfig.user;
+    doc["mqtt"]["client_id"] = mqttConfig.clientId;
+    // No enviar password por seguridad
+    
+    // Sensor (solo 1)
+    JsonObject sensor = doc.createNestedObject("sensor");
+    sensor["name"] = sensorConfig.name;
+    // sensor["type"] = sensorConfig.type;  // Comentado temporalmente si no existe
+    sensor["unit"] = sensorConfig.unit;
+    sensor["modbus_function"] = sensorConfig.modbusFunction;
+    sensor["modbus_address"] = sensorConfig.modbusAddress;
+    sensor["register_start"] = sensorConfig.registerStart;
+    sensor["register_count"] = sensorConfig.registerCount;
+    sensor["multiplier"] = sensorConfig.multiplier;
+    sensor["offset"] = sensorConfig.offset;
+    sensor["decimals"] = sensorConfig.decimals;
+    sensor["enabled"] = sensorConfig.enabled;
+    
+    String output;
+    serializeJson(doc, output);
+    return output;
+}

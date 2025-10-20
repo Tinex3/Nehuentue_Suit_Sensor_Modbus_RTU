@@ -3,18 +3,13 @@
 
 #include <Arduino.h>
 
+// Forward declaration - usar la estructura del ModbusManager
+struct ModbusResponse;
+
 // Configuración Modbus RTU Master
 #define MODBUS_SERIAL_PORT Serial1
 #define MODBUS_TIMEOUT_MS 1000
 #define MODBUS_MAX_RESPONSE_SIZE 256
-
-// Estructura para respuesta Modbus
-struct ModbusResponse {
-    uint8_t data[MODBUS_MAX_RESPONSE_SIZE];
-    size_t length;
-    bool success;
-    uint8_t exceptionCode;
-};
 
 // Funciones públicas para Modbus Master
 void modbusRTUInit(int rxPin, int txPin, unsigned long baudrate = 9600);

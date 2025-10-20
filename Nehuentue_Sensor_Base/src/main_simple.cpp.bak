@@ -1,0 +1,172 @@
+/**
+ * @file main.cpp
+ * @brief Nehuentue Suit Sensor - Firmware v2.0 Integración Progresiva
+ * @version 2.0.0
+ * @date 2025-10-19
+ * 
+ * NOTA: Integración progresiva - Fase 1
+ * - ✅ SystemManager integrado
+ * - ✅ FlashStorageManager integrado  
+ * - ✅ ModbusManager integrado
+ * - ⏳ WiFiManager (pendiente - usa código legacy)
+ * - ⏳ MQTTManager (pendiente - usa código legacy)
+ */
+
+#include <Arduino.h>
+#include <AsyncElegantOTA.h>
+
+// Managers integrados (sin conflictos)
+#include <SystemManager.h>
+#include <FlashStorageManager.h>
+#include <ModbusManager.h>
+
+// Código legacy (temporal)
+#include "config.h"
+#include "modbus_rtu.h"  // Legacy - será reemplazado por ModbusManager en tasks
+#include "tasks.h"
+#include "web_server.h"
+
+// ============================================================================
+// SETUP
+// ============================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  
+  Serial.println("\n\n");
+  Serial.println("╔══════════════════════════════════════════════╗");
+  Serial.println("║                                              ║");
+  Serial.println("║   Nehuentue Suit Sensor v2.0                 ║");
+  Serial.println("║   Integración Fase 1 - Managers Básicos      ║");
+  Serial.println("║                                              ║");
+  Serial.println("╚══════════════════════════════════════════════╝");
+  Serial.println();
+  
+  // ========================================================================
+  // 1. System Manager
+  // ========================================================================
+  Serial.println("[INIT] System Manager...");
+  SysMgr.begin();
+  SysMgr.printInfo();
+  
+  // ========================================================================
+  // 2. Flash Storage Manager
+  // ========================================================================
+  Serial.println("[INIT] Flash Storage Manager...");
+  if (FlashStorage.begin("nehuentue")) {
+    Serial.println("[INIT] ✓ Flash Storage inicializado");
+    
+    // Cargar configuración del sensor
+    if (FlashStorage.load("sensor_config", sensorConfig)) {
+      Serial.printf("[CONFIG] Sensor: '%s' (ID:%d, Start:%d, Qty:%d)\n",
+                    sensorConfig.name,
+                    sensorConfig.slaveId,
+                    sensorConfig.startAddress,
+                    sensorConfig.quantity);
+    } else {
+      Serial.println("[CONFIG] Sensor: usando valores por defecto");
+    }
+  } else {
+    Serial.println("[WARN] Flash Storage no disponible - usando valores por defecto");
+  }
+  
+  // ========================================================================
+  // 3. Modbus Manager (nuevo)
+  // ========================================================================
+  Serial.println("[INIT] Modbus Manager...");
+  ModbusMgr.begin(Serial1, sensorConfig.rxPin, sensorConfig.txPin, sensorConfig.baudrate);
+  Serial.println("[INIT] ✓ Modbus RTU Master inicializado");
+  
+  // ========================================================================
+  // 4. Inicialización legacy (WiFi, MQTT, Tasks)
+  // ========================================================================
+  Serial.println("[INIT] Módulos legacy...");
+  
+  // Modbus RTU legacy (para compatibilidad con tasks)
+  modbusRTUInit(sensorConfig.rxPin, sensorConfig.txPin, sensorConfig.baudrate);
+  
+  // Tasks FreeRTOS
+  initTasks();
+  vTaskDelay(pdMS_TO_TICKS(300));
+  
+  // Web Server
+  Serial.println("[INIT] Servidor web...");
+  initWebServer();
+  
+  // OTA
+  AsyncElegantOTA.begin(&webServer);
+  Serial.println("[INIT] ✓ OTA habilitado");
+  
+  // WiFi (legacy)
+  if (WiFi.status() == WL_CONNECTED) {
+    startSTAMode();
+  } else {
+    Serial.println("[WiFi] Iniciando modo AP");
+    startAPMode();
+  }
+  
+  // ========================================================================
+  // Sistema listo
+  // ========================================================================
+  Serial.println("\n╔══════════════════════════════════════════════╗");
+  Serial.println("║                                              ║");
+  Serial.println("║  ✅ SISTEMA INICIADO                         ║");
+  Serial.println("║                                              ║");
+  Serial.println("╚══════════════════════════════════════════════╝\n");
+  
+  SysMgr.printStatus();
+}
+
+// ============================================================================
+// LOOP
+// ============================================================================
+
+void loop() {
+  // Managers
+  SysMgr.loop();
+  
+  // OTA
+  AsyncElegantOTA.loop();
+  
+  // Estadísticas periódicas
+  static unsigned long lastStats = 0;
+  if (millis() - lastStats > 60000) {  // Cada 60 segundos
+    lastStats = millis();
+    
+    Serial.println("\n╔════════════════════════════════════════════════╗");
+    Serial.println("║  📊 ESTADÍSTICAS                               ║");
+    Serial.println("╚════════════════════════════════════════════════╝");
+    
+    // Sistema
+    SystemStatus status = SysMgr.getStatus();
+    Serial.printf("  Uptime: %lu s  |  Heap: %lu bytes\n",
+                  status.uptime / 1000, status.freeHeap);
+    Serial.printf("  WiFi: %s  |  MQTT: %s\n",
+                  status.wifiConnected ? "✓" : "✗",
+                  status.mqttConnected ? "✓" : "✗");
+    
+    // Modbus
+    ModbusMgr.printStats();
+    
+    // Datos del sensor (desde tasks legacy)
+    if (dataMutex != NULL && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      if (sensorData.valid && sensorData.registerCount > 0) {
+        Serial.printf("  Sensor: %d registros válidos (último: hace %lu ms)\n",
+                      sensorData.registerCount,
+                      millis() - sensorData.timestamp);
+        if (sensorData.registerCount > 0) {
+          Serial.printf("    Reg[0] = %d (0x%04X)\n",
+                        sensorData.registers[0], sensorData.registers[0]);
+        }
+      } else {
+        Serial.println("  ⚠ Sin datos del sensor");
+      }
+      xSemaphoreGive(dataMutex);
+    }
+    
+    Serial.println("════════════════════════════════════════════════\n");
+  }
+  
+  delay(100);
+}

@@ -1,7 +1,12 @@
 #include "modbus_rtu.h"
+#include "config.h"
+#include <ModbusManager.h>  // Para la definición completa de ModbusResponse
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+
+// Declaración externa de logError (definida en main.cpp)
+extern void logError(ErrorType type, ErrorCode code, const char* customDesc = nullptr);
 
 // Mutex para proteger acceso al puerto serial
 static SemaphoreHandle_t serialMutex = NULL;
@@ -64,6 +69,7 @@ ModbusResponse modbusSendRequest(uint8_t *request, size_t requestLength) {
     Serial.println("DEBUG: Esperando acceso al puerto serial...");
     if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(MODBUS_TIMEOUT_MS)) != pdTRUE) {
         Serial.println("ERROR: Timeout esperando mutex del puerto serial");
+        logError(ERROR_MODBUS, ERR_MODBUS_TIMEOUT, "Timeout esperando mutex serial");
         return response;
     }
     Serial.println("DEBUG: Acceso al puerto obtenido");
@@ -158,6 +164,9 @@ ModbusResponse modbusSendRequest(uint8_t *request, size_t requestLength) {
     
     if (bytesRead == 0) {
         Serial.println("ERROR: Timeout - No se recibió respuesta");
+        char desc[128];
+        snprintf(desc, sizeof(desc), "Sin respuesta del slave ID %d", request[0]);
+        logError(ERROR_MODBUS, ERR_MODBUS_NO_RESPONSE, desc);
         return response;
     }
     
@@ -175,6 +184,9 @@ ModbusResponse modbusSendRequest(uint8_t *request, size_t requestLength) {
         uint16_t calcCrc = modbusCalculateCRC(response.data, bytesRead - 2);
         Serial.printf("  CRC recibido: 0x%04X\n", recvCrc);
         Serial.printf("  CRC calculado: 0x%04X\n", calcCrc);
+        char desc[128];
+        snprintf(desc, sizeof(desc), "CRC error: esperado 0x%04X, recibido 0x%04X", calcCrc, recvCrc);
+        logError(ERROR_MODBUS, ERR_MODBUS_CRC_ERROR, desc);
         return response;
     }
     Serial.println("DEBUG: CRC válido ✓");
@@ -183,6 +195,9 @@ ModbusResponse modbusSendRequest(uint8_t *request, size_t requestLength) {
     if ((response.data[1] & 0x80) != 0) {
         response.exceptionCode = response.data[2];
         Serial.printf("EXCEPCIÓN Modbus: 0x%02X\n", response.exceptionCode);
+        char desc[128];
+        snprintf(desc, sizeof(desc), "Excepción Modbus 0x%02X del slave ID %d", response.exceptionCode, response.data[0]);
+        logError(ERROR_MODBUS, ERR_MODBUS_EXCEPTION, desc);
         return response;
     }
     
