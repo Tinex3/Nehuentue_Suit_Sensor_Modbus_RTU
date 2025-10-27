@@ -1,0 +1,58 @@
+# Platformio build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.clang_complete
+.gcc-flags.json
+
+# Arduino build artifacts
+build/
+*.hex
+*.bin
+*.elf
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+*.code-workspace
+.idea/
+*.sublime-*
+
+# Test files
+test/output/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Credentials and sensitive data
+secrets.h
+*.key
+*.pem
+*.crt
